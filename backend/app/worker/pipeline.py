@@ -38,7 +38,7 @@ from app.core.models import (
     Timeline,
     Word,
 )
-from app.db.models import Job
+from app.db.models import NO_LOGO_ID, Job
 from app.db.session import session_scope
 from app.providers.bullet_timing import time_bullets
 from app.providers.gemini_script import scene_clip_prompt, scene_role
@@ -220,7 +220,43 @@ async def _stage_script(job: Job, job_dir: Path, theme: Theme | None = None) -> 
         # Stamped on the Timeline so the palette is persisted with the job's debug trail
         # and visible to the planner. The render backend still takes it by constructor.
         timeline.theme = theme
+    timeline.logo_path = resolve_job_logo(job)
     return timeline
+
+
+def resolve_job_logo(job: Job) -> str | None:
+    """What `Timeline.logo_path` should be for this job. Same three states as `Job.logo_id`.
+
+    Resolved to a *path* here, at script time, for the same reason the theme is stamped:
+    the Timeline is the self-describing artifact, so a re-render from a persisted Timeline
+    reproduces the branding without re-reading config or the upload store.
+
+    A logo id that no longer resolves (the file was deleted out from under the job) falls
+    back to the default mark with a warning rather than failing the render — branding is
+    the last 1% of the frame, and losing it must not cost the other 99%.
+    """
+    choice = (job.logo_id or "").strip()
+    if not choice:
+        return None  # the configured default; None is what "say nothing" has always meant
+    if choice.lower() == NO_LOGO_ID:
+        # `resolve_logo_source` reads this spelling as an explicit opt-out, and persisting
+        # the sentinel rather than a path keeps the Timeline honest about the *choice*.
+        return NO_LOGO_ID
+
+    # Imported here, not at module scope: the worker must not depend on the HTTP layer
+    # booting, and this is the only place it needs the upload store.
+    from app.api.logos import logo_render_path
+
+    path = logo_render_path(choice)
+    if path is None:
+        logger.warning(
+            "job %s names logo %r, which is no longer in the store; "
+            "rendering with the default mark",
+            job.id,
+            choice,
+        )
+        return None
+    return str(path)
 
 
 def _api_concurrency() -> int:
@@ -356,6 +392,39 @@ async def _stage_plan(timeline: Timeline) -> Timeline:
     return await asyncio.to_thread(planner.plan, timeline)
 
 
+def _video_backend(timeline: Timeline, theme: Theme | None) -> Any:
+    """The render backend, on this job's palette *and* this job's brand mark.
+
+    ``FFmpegBackend`` takes the mark as a constructor argument (``logo_path=``) and resolves
+    it exactly once via ``resolve_logo_source``, whose three states line up with
+    ``Timeline.logo_path``: ``AUTO_LOGO`` for the configured default, ``"none"`` for no
+    branding, a path for an upload. ``factory.video_backend`` does not forward a
+    ``logo_path`` yet, so this passes it when the factory grows one and otherwise assigns
+    the resolved source before any render call — which is equivalent, because the
+    constructor does nothing else with it.
+    """
+    from app.render.ffmpeg_backend import AUTO_LOGO, resolve_logo_source
+
+    configured = timeline.logo_path if timeline.logo_path is not None else AUTO_LOGO
+    try:
+        params = inspect.signature(factory.video_backend).parameters
+    except (TypeError, ValueError):  # pragma: no cover - factory is a plain function
+        params = {}
+    if "logo_path" in params:
+        return factory.video_backend(theme=theme, logo_path=configured)
+
+    backend = factory.video_backend(theme=theme)
+    if hasattr(backend, "logo_source"):
+        backend.logo_source = resolve_logo_source(configured)
+    elif timeline.logo_path is not None:
+        logger.warning(
+            "render backend %s takes no brand logo; this job's choice (%s) is being ignored",
+            type(backend).__name__,
+            timeline.logo_path,
+        )
+    return backend
+
+
 async def _stage_render(timeline: Timeline, job_dir: Path, theme: Theme | None = None) -> Timeline:
     """One clip per scene, from the planned timeline.
 
@@ -367,7 +436,7 @@ async def _stage_render(timeline: Timeline, job_dir: Path, theme: Theme | None =
     it from — ``Timeline.theme`` carries the same palette for the planner and the debug
     trail, but the backend does not consult it.
     """
-    backend = factory.video_backend(theme=theme)
+    backend = _video_backend(timeline, theme)
 
     # Imported here, not at module scope: the API must boot even when the render
     # backend is unavailable (see factory's lazy resolution).
@@ -441,7 +510,9 @@ def _stage_bullets(timeline: Timeline) -> Timeline:
 
 
 async def _stage_assemble(timeline: Timeline, job_dir: Path, theme: Theme | None = None) -> Path:
-    backend = factory.video_backend(theme=theme)
+    # The watermark is composited here, in `assemble` — once over the finished chain, never
+    # per scene — so this is the construction that actually has to carry the job's mark.
+    backend = _video_backend(timeline, theme)
     out = job_dir / "video.mp4"
     return await asyncio.to_thread(backend.assemble, timeline, out)
 

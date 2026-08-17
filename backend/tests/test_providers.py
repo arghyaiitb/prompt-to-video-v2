@@ -76,7 +76,8 @@ from app.providers.gemini_script import (
     LANGUAGE_ANCHOR_NOTES,
     LANGUAGE_CLAUSES,
     LANGUAGE_NAMES,
-    MEASURED_WPM,
+    LANGUAGE_WORD_FACTOR,
+    LANGUAGE_WPM,
     ROLE_NARRATION_WORDS,
     STRUCTURE_FROM_SLIDES,
     SUMMARY_FROM_SLIDES,
@@ -99,6 +100,7 @@ from app.providers.gemini_script import (
     narration_words,
     role_bullet_target,
     role_plan,
+    role_sentences,
     scene_clip_prompt,
     scene_role,
     words_spoken_in,
@@ -2157,21 +2159,46 @@ class TestScriptLanguage:
         assert floor < seconds < ceiling, (role, language, target, seconds)
 
     def test_a_language_that_speaks_faster_gets_more_words(self):
-        """Spanish and Hindi need more words for the same content AND speak faster, so
-        re-using English's budget would make the scene short, not long."""
+        """Spanish and Hindi speak faster than English word-for-word, so re-using English's
+        budget makes the scene SHORT, not long — the opposite of the intuition that Spanish
+        "runs longer". Both are true: es needs 1.12x the words to say the same thing, and gets
+        1.04x the budget, which is `LANGUAGES.md` §6.3's content-per-slide loss.
+
+        Monotonic but not strictly so at every role: at 1.04x the Spanish title target rounds
+        back onto English's 10, which is the documented table, not a bug.
+        """
         assert language_word_factor(Language.EN) == 1.0
         assert language_word_factor(Language.ES) > 1.0
         assert language_word_factor(Language.HI) > language_word_factor(Language.ES)
         for role in SceneRole:
-            en = narration_words(role, Language.EN)
-            assert narration_words(role, Language.ES)[1] > en[1]
-            assert narration_words(role, Language.HI)[1] > en[1]
+            en_low, en_target, en_high = narration_words(role, Language.EN)
+            es_low, es_target, es_high = narration_words(role, Language.ES)
+            hi_low, hi_target, hi_high = narration_words(role, Language.HI)
+            assert es_target >= en_target and es_high >= en_high, role
+            assert hi_target > en_target and hi_high > en_high, role
+            assert hi_target >= es_target and hi_low >= es_low, role
+        # ...and strictly more somewhere, or the scaling is doing nothing at all.
+        assert narration_words(SceneRole.CONTENT, Language.ES)[1] > (
+            narration_words(SceneRole.CONTENT, Language.EN)[1]
+        )
 
-    def test_the_factor_is_the_measured_rate_ratio_and_nothing_else(self):
-        """One number per language, derived — so a budget cannot drift from its evidence."""
-        for language, wpm in MEASURED_WPM.items():
-            expected = round(wpm / MEASURED_WPM[Language.EN], 2)
-            assert language_word_factor(language) == expected
+    def test_the_budgets_are_the_ones_in_LANGUAGES_md(self):
+        """`docs/LANGUAGES.md` §6.2 is the authority; these are transcribed from it, not
+        recomputed, because multiply-then-round does not reproduce its table exactly."""
+        assert narration_words(SceneRole.CONTENT, Language.ES) == (26, 35, 45)
+        assert narration_words(SceneRole.CONTENT, Language.HI) == (29, 39, 50)
+        assert narration_words(SceneRole.TITLE, Language.ES) == (9, 10, 15)
+        assert narration_words(SceneRole.TITLE, Language.HI) == (10, 12, 16)
+        assert narration_words(SceneRole.SUMMARY, Language.ES) == (21, 28, 32)
+        assert narration_words(SceneRole.SUMMARY, Language.HI) == (23, 31, 36)
+        assert narration_words(SceneRole.CLOSING, Language.ES) == (14, 18, 21)
+        assert narration_words(SceneRole.CLOSING, Language.HI) == (15, 20, 23)
+        # Effective pace, §6.2. English is DIRECTION §5's 135, untouched.
+        assert language_wpm(Language.EN) == WORDS_PER_MINUTE == 135.0
+        assert language_wpm(Language.ES) == 140.0
+        assert language_wpm(Language.HI) == 155.0
+        assert LANGUAGE_WORD_FACTOR == {Language.EN: 1.0, Language.ES: 1.04, Language.HI: 1.15}
+        assert LANGUAGE_WPM[Language.EN] == WORDS_PER_MINUTE
 
     @pytest.mark.parametrize("language", list(Language))
     def test_the_prompt_states_the_languages_own_budget_and_pace(self, monkeypatch, language):
@@ -2183,6 +2210,25 @@ class TestScriptLanguage:
                 f"scene {index} — role: {role.value} — narration {target} words "
                 f"({low}-{high})"
             ) in prompt
+
+    @pytest.mark.parametrize("language", [Language.ES, Language.HI])
+    def test_a_non_english_scene_gets_a_sentence_budget_too(self, monkeypatch, language):
+        """`docs/LANGUAGES.md` §6.3: the same 34-word budget produced 20.2-23.5s of staccato
+        English and 12.8-13.0s of Hindi, purely on sentence count. A word budget with no
+        sentence budget is not a duration, so the two travel together."""
+        prompt = self._prompt(monkeypatch, slide_count=7, language=language)
+        for index, role in enumerate(role_plan(7), start=1):
+            assert f"scene {index} — role: {role.value}" in prompt
+            assert role_sentences(role) in prompt
+
+    def test_english_is_left_out_of_the_sentence_budget_on_purpose(self, monkeypatch):
+        """§6.3 says English needs this MORE than the others — its 34-word content scenes run
+        20-23s against a 19.0s max. But retuning English pacing inside a language change would
+        move a number DIRECTION §5 owns and other tests measure, so it is reported, not done.
+        """
+        prompt = self._prompt(monkeypatch, slide_count=7, language=Language.EN)
+        for role in SceneRole:
+            assert role_sentences(role) not in prompt
 
     def test_words_spoken_in_follows_the_language(self):
         assert words_spoken_in(60.0) == pytest.approx(WORDS_PER_MINUTE)
@@ -2463,7 +2509,7 @@ class TestLiveScriptLanguage:
 
             for anchor in find_anchors(
                 scene.bullets,
-                self._words(scene.narration, MEASURED_WPM[language]),
+                self._words(scene.narration, language_wpm(language)),
                 0.0,
                 seconds,
             ):

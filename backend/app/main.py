@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import engines, jobs, themes, voices
+from app.api import engines, jobs, logos, themes, voices
 from app.core.config import get_settings
 from app.db.session import init_db
 
@@ -24,6 +24,9 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
     settings.video_output_dir.mkdir(parents=True, exist_ok=True)
     settings.video_cache_dir.mkdir(parents=True, exist_ok=True)
+    # Uploaded brand marks. Created up front so the first POST /api/logos does not have to
+    # be the thing that discovers the cache directory is unwritable.
+    settings.logo_dir.mkdir(parents=True, exist_ok=True)
     init_db()
     yield
 
@@ -40,6 +43,7 @@ app.add_middleware(
 
 app.include_router(engines.router)
 app.include_router(jobs.router)
+app.include_router(logos.router)
 app.include_router(themes.router)
 app.include_router(voices.router)
 

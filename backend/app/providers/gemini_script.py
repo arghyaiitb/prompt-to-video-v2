@@ -37,8 +37,10 @@ Two things do NOT translate, and the split is deliberate:
     image and video models, which are English-trained; a Hindi prompt degrades the frame
     for no benefit, since nothing in a visual prompt is ever seen or heard by a viewer.
   * the word budgets are not the English ones. A word budget is a DURATION (audio is the
-    clock), so the budget must be scaled by the language's measured speaking rate or the
-    scene overruns its role's window. See `LANGUAGE_WPM`.
+    clock), so it is per-language: 25-43 words of English but 26-45 Spanish or 29-50 Hindi for
+    the same 11-19s content window. Every number comes from `docs/LANGUAGES.md` §6.2, and a
+    SENTENCE budget rides along with it, because §6.3 measured sentence count — not language —
+    as the dominant influence on how long a narration takes to speak.
 
 ANCHORING IS NOT UNIFORM ACROSS SCRIPTS — the load-bearing caveat. `bullet_timing` matches
 bullets to narration through `deepgram_align.normalize`, which reduces a token to `[a-z0-9]`
@@ -850,44 +852,42 @@ def coerce_language(value: Any) -> Language:
 
 
 def language_word_factor(language: Language = Language.EN) -> float:
-    """Multiplier on the English word budgets for `language`. See `LANGUAGE_WORD_FACTOR`."""
+    """Words-per-second ratio to English for `language` — `docs/LANGUAGES.md` §6.2."""
     return LANGUAGE_WORD_FACTOR.get(language, 1.0)
 
 
 def language_wpm(language: Language = Language.EN) -> float:
-    """Planning pace for `language`: the rate at which its scaled budget hits the role window.
+    """Effective narration pace for `language` — `docs/LANGUAGES.md` §6.2.
 
-    Anchored on the English spec rate rather than on `MEASURED_WPM[EN]`, so English stays
-    exactly 135 wpm and every other language is expressed relative to it.
+    en 135 (DIRECTION §5, unchanged), es 140, hi 155.
     """
-    return WORDS_PER_MINUTE * language_word_factor(language)
+    return LANGUAGE_WPM.get(language, WORDS_PER_MINUTE)
 
 
 def narration_words(role: SceneRole, language: Language = Language.EN) -> tuple[int, int, int]:
     """(min, target, max) narration words for `role`. Audio is the clock, so this is the
     only lever the script has on how long a scene lasts.
 
-    Scaled by `language`, because the budget is a duration: the same 11-19s content window
-    buys 25-43 English words but 35-61 Spanish ones. `language` is positional-with-default so
-    every existing caller — and every published number in `docs/DIRECTION.md` §1.2 — is
-    untouched.
+    Per-language, because the budget is a duration: the same 11-19s content window buys 25-43
+    English words but 26-45 Spanish or 29-50 Hindi ones (`docs/LANGUAGES.md` §6.2).
+    `language` is positional-with-default, so every existing caller — and every published
+    number in `docs/DIRECTION.md` §1.2 — is untouched.
 
     Notably it does NOT vary with `bullets_per_slide`. A content scene is 11-19s whatever it
     carries, so its word budget is fixed; asking for one fewer point buys a slower reveal,
     not a shorter scene.
     """
-    low, target, high = ROLE_NARRATION_WORDS[role]
-    factor = language_word_factor(language)
-    if factor == 1.0:
-        return low, target, high
-    # Rounded independently then re-ordered: rounding three numbers can in principle
-    # collapse or invert the range, and a min above its max would be sent to the model.
-    scaled = sorted(max(1, round(value * factor)) for value in (low, target, high))
-    return scaled[0], scaled[1], scaled[2]
+    table = ROLE_NARRATION_WORDS_BY_LANGUAGE.get(language, ROLE_NARRATION_WORDS)
+    return table[role]
+
+
+def role_sentences(role: SceneRole) -> str:
+    """How many sentences this role's narration should be. See `ROLE_SENTENCES`."""
+    return ROLE_SENTENCES[role]
 
 
 def words_spoken_in(seconds: float, language: Language = Language.EN) -> float:
-    """Words a narrator gets through in `seconds`, at `language`'s planning pace."""
+    """Words a narrator gets through in `seconds`, at `language`'s effective pace."""
     return seconds * language_wpm(language) / 60.0
 
 
@@ -1086,9 +1086,12 @@ def _structure_block(
         bullets = role_bullet_target(role, bullet_count)
         low, target, high = narration_words(role, language)
         plural = "" if bullets == 1 else "s"
+        # The sentence budget is appended for non-English only — see `ROLE_SENTENCES` for
+        # why English is left exactly as it was.
+        sentences = "" if language is Language.EN else f" — {role_sentences(role)}"
         lines.append(
             f"  scene {index} — role: {role.value} — narration {target} words "
-            f"({low}-{high}) — {bullets} bullet{plural}"
+            f"({low}-{high}) — {bullets} bullet{plural}{sentences}"
         )
     return "\n".join(lines)
 

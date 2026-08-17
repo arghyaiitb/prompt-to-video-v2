@@ -467,12 +467,22 @@ class Timeline(BaseModel):
 
 
 class JobStatus(StrEnum):
+    """Pipeline stages. The values are contractual — the frontend stepper renders them."""
+
     QUEUED = "queued"
     SCRIPTING = "scripting"
     IMAGING = "imaging"
     NARRATING = "narrating"
     ALIGNING = "aligning"
+
     SCORING = "scoring"
+    """Composing the MUSIC bed — "scoring" as in a film score.
+
+    NOT quality scoring. ``app/evaluate/`` is a separate, deliberately offline tool run
+    via ``scripts/evaluate_job.py``; nothing in the pipeline imports it. The name has
+    misled readers into thinking each render is graded automatically. It is not.
+    """
+
     RENDERING = "rendering"
     ASSEMBLING = "assembling"
     DONE = "done"

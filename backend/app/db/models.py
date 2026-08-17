@@ -35,6 +35,15 @@ CUSTOM_THEME_NAME = "custom"
 
 DEFAULT_BULLETS_PER_SLIDE = 4
 
+#: `Job.logo_id` value meaning "render with no brand mark at all".
+#:
+#: Distinct from NULL, which means "the bundled default mark" — the behaviour of every job
+#: created before uploads existed. It lives here rather than in `app.api.logos` because the
+#: DB layer is what both the API and the worker already import, and it is a stored value.
+#: It is also exactly the spelling `render.ffmpeg_backend.resolve_logo_source` already
+#: reads as an explicit opt-out, so the pipeline can stamp it straight onto the Timeline.
+NO_LOGO_ID = "none"
+
 #: Fallback `Job.tts_engine` — also the literal baked into the ALTER TABLE default, so it
 #: has to be a constant rather than a settings read.
 FALLBACK_TTS_ENGINE = "deepgram"
@@ -88,6 +97,15 @@ class Job(SQLModel, table=True):
     finished must be able to say what actually narrated it, and this value decides whether
     `Scene.ssml` is used at all. Only an engine declaring `supports_ssml` receives the
     marked-up narration; Deepgram Aura would read the tags aloud.
+    """
+
+    logo_id: str | None = None
+    """Uploaded brand mark for this video — an id from POST /api/logos.
+
+    Three states, all meaningful: NULL is "the bundled default mark" (which is what every
+    job did before uploads existed), `NO_LOGO_ID` is an explicit "no branding at all", and
+    an id names a file in `settings.logo_dir`. Stored as the id rather than a path so the
+    store can be relocated, and so DELETE /api/logos/{id} can see that a job needs it.
     """
 
     theme: str = Field(default_factory=default_theme_name)
@@ -163,6 +181,9 @@ _ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
     ("bullets_per_slide", f"INTEGER NOT NULL DEFAULT {DEFAULT_BULLETS_PER_SLIDE}"),
     ("tone", "VARCHAR"),
     ("tts_engine", f"VARCHAR NOT NULL DEFAULT '{FALLBACK_TTS_ENGINE}'"),
+    # Nullable with no default on purpose: NULL is the meaningful "bundled default mark"
+    # state, so every pre-existing row keeps rendering exactly the branding it had.
+    ("logo_id", "VARCHAR"),
 )
 
 

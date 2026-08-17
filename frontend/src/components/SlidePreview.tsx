@@ -2,6 +2,7 @@ import { ImageIcon } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
 import type { Palette } from '@/lib/contrast'
+import { LOGO_HEIGHT_FRACTION, LOGO_MARGIN_FRACTION } from '@/lib/logo'
 
 /**
  * A 16:9 mock of the `hero_right` slide — the workhorse training layout.
@@ -54,11 +55,31 @@ const INDENT = MARKER_EMPHASIS + BULLET_SIZE * 0.55
 /** `Theme.image_radius` is 24px at 1920. */
 const IMAGE_RADIUS = (24 / 1920) * 100
 
+/*
+ * Watermark geometry — `Theme.logo_*` in `app/core/models.py`, placed by
+ * `logo_rect()` in `app/render/text_overlay.py`.
+ *
+ * The height is a fraction of the frame *height*; the inset is a fraction of the
+ * frame *width* on both axes, which is why only one of these is multiplied by H.
+ */
+const LOGO_H = LOGO_HEIGHT_FRACTION * 100 * H
+const LOGO_MARGIN = LOGO_MARGIN_FRACTION * 100
+
 const cqw = (value: number): string => `${value.toFixed(4)}cqw`
 
 export interface PreviewBullet {
   text: string
   emphasis: boolean
+}
+
+/** The brand mark as the compositor will lay it down. */
+export interface PreviewLogo {
+  /** Image URL — an object URL for a pending upload, `/api/logos/{id}` for a stored one. */
+  src: string
+  /** `Theme.logo_opacity`: 0.85, or 0.92 on the light presets. */
+  opacity: number
+  /** Rendered instead of an image — the outline when nothing is selected. */
+  placeholder?: boolean
 }
 
 const SAMPLE_HEADING = 'Report it, then stop touching it'
@@ -77,6 +98,14 @@ interface SlidePreviewProps {
   bullets?: PreviewBullet[]
   /** Card-sized: fewer bullets, no panel label. Used by the preset swatches. */
   compact?: boolean
+  /**
+   * Brand mark to composite bottom-left, or `null` for an unbranded frame.
+   *
+   * Drawn at the renderer's own scale, inset and opacity, so the mock answers the
+   * only question that matters before a three-minute render: is this legible at
+   * 4.5% of frame height?
+   */
+  logo?: PreviewLogo | null
   className?: string
 }
 
@@ -85,6 +114,7 @@ export function SlidePreview({
   heading = SAMPLE_HEADING,
   bullets = SAMPLE_BULLETS,
   compact = false,
+  logo = null,
   className,
 }: SlidePreviewProps) {
   const shown = compact ? bullets.slice(0, 2) : bullets.slice(0, 4)
@@ -219,6 +249,39 @@ export function SlidePreview({
           ))}
         </ul>
       </div>
+
+      {/* Brand mark — composited once over the finished chain, bottom-left,
+          constant for the whole video. Not per scene: a logo burnt into each
+          clip would pulse at every crossfade. */}
+      {logo !== null && (
+        <div
+          className="absolute flex items-end"
+          style={{
+            left: cqw(LOGO_MARGIN),
+            bottom: cqw(LOGO_MARGIN),
+            height: cqw(LOGO_H),
+            opacity: logo.opacity,
+          }}
+        >
+          {logo.placeholder === true ? (
+            <span
+              className="h-full rounded-[1px] border border-dashed"
+              style={{
+                width: cqw(LOGO_H * 1.6),
+                borderColor: palette.muted,
+              }}
+            />
+          ) : (
+            <img
+              src={logo.src}
+              alt=""
+              // `height: 100%` with auto width is exactly `-resize x{height}`:
+              // the mark's own aspect ratio decides how wide it lands.
+              className="h-full w-auto max-w-none object-contain object-left-bottom"
+            />
+          )}
+        </div>
+      )}
     </div>
   )
 }

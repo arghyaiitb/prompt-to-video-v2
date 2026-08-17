@@ -16,15 +16,19 @@ import {
 import {
   DEEPGRAM_ENGINE_ID,
   DEFAULT_ENGINE_ID,
+  DEFAULT_NO_LOGO_VALUE,
   DEFAULT_THEME_ID,
   OPTIONAL_JOB_FIELDS,
   PIPELINE_STAGES,
   POLLY_ENGINE_ID,
+  type BrandLogo,
   type Bullet,
   type CreateJobRequest,
   type CreateJobResponse,
   type Job,
   type JobStatus,
+  type LogoCatalogue,
+  type LogoRejection,
   type PipelineStage,
   type ScenePlan,
   type SpeechEngine,
@@ -662,7 +666,7 @@ function parseThemePreset(raw: unknown): ThemePreset | null {
   const id = readString(record, 'id', 'name', 'key')
   if (id === null) return null
 
-  return {
+  const preset: ThemePreset = {
     id,
     name: readString(record, 'name', 'label', 'title') ?? id,
     description: readString(record, 'description', 'blurb', 'summary') ?? '',
@@ -673,6 +677,14 @@ function parseThemePreset(raw: unknown): ThemePreset | null {
     swatches,
     contrast: parseContrastMap(record.contrast ?? record.contrast_report),
   }
+
+  // Not serialised by `list_themes()` today, but `ThemeOut` is `extra="allow"`,
+  // so it can appear without a client change. Left absent when it does not, and
+  // `logoOpacityFor` derives it from `is_light`.
+  const logoOpacity = readNumber(record, 'logo_opacity', 'logoOpacity')
+  if (logoOpacity !== null && logoOpacity > 0) preset.logo_opacity = Math.min(1, logoOpacity)
+
+  return preset
 }
 
 /**
@@ -729,6 +741,141 @@ export function parseVoiceEngineMismatch(detail: unknown): VoiceEngineMismatch |
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * Brand-logo parsers
+ *
+ * `/api/logos` does not exist on the running instance (verified: 404), so these
+ * are written against the field names the backend agent published and accept the
+ * plausible variants of each, the same way `parseEngine` accepts both `default`
+ * and `is_default`.
+ * ------------------------------------------------------------------ */
+
+function parseBrandLogo(raw: unknown): BrandLogo | null {
+  // A bare id is accepted: an early build may answer `["abc123", "def456"]`.
+  if (typeof raw === 'string') {
+    const id = raw.trim()
+    if (id === '') return null
+    return {
+      id,
+      url: `${API_BASE}/logos/${encodeURIComponent(id)}`,
+      width: null,
+      height: null,
+      format: null,
+      has_alpha: null,
+      warning: null,
+      original_filename: null,
+      bytes: null,
+      created_at: null,
+    }
+  }
+
+  const record = asRecord(raw)
+  if (record === null) return null
+
+  const id = readString(record, 'id', 'logo_id', 'logoId', 'key', 'name', 'filename')
+  if (id === null) return null
+
+  return {
+    id,
+    // A relative path from the server wins; otherwise the documented route is
+    // derived, because a logo we cannot draw is not worth offering.
+    url:
+      readString(record, 'url', 'href', 'file_url', 'fileUrl', 'path', 'location') ??
+      `${API_BASE}/logos/${encodeURIComponent(id)}`,
+    width: readNumber(record, 'width', 'w', 'pixel_width'),
+    height: readNumber(record, 'height', 'h', 'pixel_height'),
+    format: readString(record, 'format', 'content_type', 'contentType', 'mime', 'ext')?.toLowerCase() ?? null,
+    // Absent means unknown, never "no": an opaque mark composites as a solid
+    // rectangle, so the difference is worth reporting honestly.
+    has_alpha: readBoolean(record, 'has_alpha', 'hasAlpha', 'alpha', 'transparent'),
+    warning: readString(record, 'warning', 'warnings', 'notice', 'caveat', 'message'),
+    original_filename: readString(record, 'original_filename', 'originalFilename', 'filename', 'name'),
+    bytes: readNumber(record, 'bytes', 'size', 'size_bytes', 'byte_size'),
+    created_at: readString(record, 'created_at', 'createdAt', 'uploaded_at', 'created'),
+  }
+}
+
+/**
+ * Reads the catalogue, including the server's own spelling of "no logo".
+ *
+ * The backend agent was still choosing between `"none"` and another spelling, so
+ * an envelope field naming it is honoured when present and `DEFAULT_NO_LOGO_VALUE`
+ * is assumed otherwise. Whatever wins, an entry *matching* it is filtered out of
+ * the uploaded list: "no logo" is one of the picker's own fixed options, not a
+ * logo someone uploaded.
+ */
+export function parseLogoCatalogue(payload: unknown): Omit<LogoCatalogue, 'available'> {
+  const envelope = asRecord(payload)
+  const noneValue =
+    (envelope === null
+      ? null
+      : readString(
+          envelope,
+          'none_value',
+          'noneValue',
+          'no_logo_value',
+          'noLogoValue',
+          'none_id',
+          'disabled_value',
+          'sentinel',
+        )) ?? DEFAULT_NO_LOGO_VALUE
+
+  const logos = readList(payload, 'logos', 'items', 'data', 'results')
+    .map(parseBrandLogo)
+    .filter((logo): logo is BrandLogo => logo !== null && logo.id !== noneValue)
+
+  return { logos, noneValue }
+}
+
+/**
+ * Pulls a logo-specific 422 out of a body, or `null`.
+ *
+ * Two shapes have to be recognised, because they mean different things:
+ *
+ * 1. A tagged object — `{error: "unknown_logo", …}` — the endpoint saying the id
+ *    is not one of its own. The user picks a different logo.
+ * 2. A list of pydantic errors whose `loc` names `logo_id`. `extra_forbidden`
+ *    there means the backend has no `logo_id` field at all, which is a different
+ *    remedy: switch to the built-in mark and the job goes through.
+ *
+ * Either way the answer is to show it, not to retry without the field.
+ */
+export function parseLogoRejection(detail: unknown, sent: string | null): LogoRejection | null {
+  const record = asRecord(detail)
+  if (record !== null) {
+    const error = readString(record, 'error', 'code') ?? ''
+    if (!/logo/i.test(error)) return null
+    return {
+      message:
+        readString(record, 'message', 'detail') ??
+        'The server rejected that brand logo.',
+      logoId: sent,
+      unsupported: /unsupported|unknown_field|not_supported|extra/i.test(error),
+    }
+  }
+
+  if (!Array.isArray(detail)) return null
+  for (const item of detail) {
+    const entry = asRecord(item)
+    if (entry === null) continue
+    const loc = Array.isArray(entry.loc)
+      ? entry.loc.filter((part): part is string => typeof part === 'string')
+      : []
+    if (!loc.includes('logo_id')) continue
+    const type = readString(entry, 'type') ?? ''
+    const message = readString(entry, 'msg', 'message')
+    const unsupported = type.includes('extra') || type.includes('unexpected')
+    return {
+      message: unsupported
+        ? 'This backend does not accept a brand logo yet.'
+        : (message ?? 'The server rejected that brand logo.'),
+      logoId: sent,
+      unsupported,
+    }
+  }
+  return null
+}
+
 /**
  * @param fallbackId used when the payload omits its own id — the detail
  *   endpoint is documented to return only status fields.
@@ -750,7 +897,7 @@ export function parseJob(raw: unknown, fallbackId?: string): Job | null {
   if (progress > 0 && progress <= 1 && !Number.isInteger(progress)) progress *= 100
   progress = Math.max(0, Math.min(100, Math.round(progress)))
 
-  return {
+  const job: Job = {
     job_id: jobId,
     status,
     progress,
@@ -769,6 +916,20 @@ export function parseJob(raw: unknown, fallbackId?: string): Job | null {
     bullets_per_slide: readNumber(record, 'bullets_per_slide', 'bulletsPerSlide'),
     tone: readString(record, 'tone'),
   }
+
+  /*
+   * `logo_id` is three-state, so `readString` alone is not enough: it collapses
+   * "the server sent null" into the same `null` as "the server has no such
+   * field". Those mean different things — null is documented as "fall back to the
+   * built-in mark", absent means the backend predates the feature — and the badge
+   * shows nothing for the latter rather than inventing history.
+   */
+  const logoKey = ['logo_id', 'logoId', 'logo'].find((key) => key in record)
+  if (logoKey !== undefined) {
+    job.logo_id = readString(record, 'logo_id', 'logoId', 'logo')
+  }
+
+  return job
 }
 
 /* ------------------------------------------------------------------ *
@@ -1020,6 +1181,160 @@ export async function fetchThemes(): Promise<{ themes: ThemePreset[]; usedFallba
   }
 }
 
+/* ------------------------------------------------------------------ *
+ * Brand logos
+ * ------------------------------------------------------------------ */
+
+/**
+ * Fetches the uploaded-logo catalogue. Never rejects.
+ *
+ * `available: false` is the expected state while `/api/logos` is being written:
+ * the form keeps the built-in mark selected and says uploads are unavailable
+ * rather than breaking. A 404 and an unreachable server are both "not available"
+ * — from the form's point of view there is nothing to upload to either way.
+ */
+export async function fetchLogos(): Promise<LogoCatalogue> {
+  try {
+    const payload = await request('/logos')
+    const { logos, noneValue } = parseLogoCatalogue(payload)
+    // An empty list from a live endpoint is a real, useful state: uploading
+    // works, nothing has been uploaded yet.
+    return { logos, available: true, noneValue }
+  } catch {
+    return { logos: [], available: false, noneValue: DEFAULT_NO_LOGO_VALUE }
+  }
+}
+
+/** Thrown by `uploadLogo` when the endpoint is not there at all. */
+export class LogoUploadUnavailableError extends Error {
+  constructor() {
+    super('This backend does not accept logo uploads yet.')
+    this.name = 'LogoUploadUnavailableError'
+  }
+}
+
+/**
+ * Uploads a logo, reporting progress.
+ *
+ * `XMLHttpRequest` rather than `fetch`, for one reason: `fetch` cannot report
+ * upload progress (request streams are not available for this in Safari, and
+ * `duplex: 'half'` is a different feature). A 4MiB file on a slow link is long
+ * enough that a bar beats a spinner.
+ *
+ * The `Content-Type` is deliberately not set — the browser has to add the
+ * multipart boundary, and setting it by hand produces a 422 with no boundary.
+ */
+export async function uploadLogo(
+  file: File,
+  onProgress?: (fraction: number) => void,
+): Promise<BrandLogo> {
+  try {
+    return await postLogo(file, 'file', onProgress)
+  } catch (cause) {
+    // FastAPI names the multipart field after its `UploadFile` parameter, and
+    // `file` is the convention — but if this build called it something else the
+    // 422 says so precisely (`loc: ["body", "<name>"], type: "missing"`), which
+    // is worth one retry rather than a dead end. Only the *named* field is
+    // retried; nothing is guessed.
+    const named = cause instanceof ApiError && cause.status === 422 ? missingFormField(cause.detail) : null
+    if (named === null || named === 'file') throw cause
+    return postLogo(file, named, onProgress)
+  }
+}
+
+/** The single missing multipart field a 422 names, or `null`. */
+function missingFormField(detail: unknown): string | null {
+  if (!Array.isArray(detail)) return null
+  for (const item of detail) {
+    const entry = asRecord(item)
+    if (entry === null) continue
+    if (!(readString(entry, 'type') ?? '').includes('missing')) continue
+    const loc = Array.isArray(entry.loc)
+      ? entry.loc.filter((part): part is string => typeof part === 'string')
+      : []
+    const name = loc.at(-1)
+    if (name !== undefined && name !== 'body') return name
+  }
+  return null
+}
+
+function postLogo(
+  file: File,
+  field: string,
+  onProgress?: (fraction: number) => void,
+): Promise<BrandLogo> {
+  const form = new FormData()
+  form.append(field, file, file.name)
+
+  return new Promise<BrandLogo>((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `${API_BASE}/logos`)
+    xhr.responseType = 'text'
+    xhr.setRequestHeader('Accept', 'application/json')
+
+    xhr.upload.onprogress = (event) => {
+      if (!event.lengthComputable || onProgress === undefined) return
+      onProgress(Math.min(1, event.loaded / Math.max(1, event.total)))
+    }
+
+    xhr.onerror = () => {
+      reject(new ApiError('Cannot reach the server. Is the backend running?', 0))
+    }
+    xhr.onabort = () => {
+      reject(new ApiError('Upload cancelled.', 0))
+    }
+
+    xhr.onload = () => {
+      let payload: unknown = null
+      if (xhr.responseText !== '') {
+        try {
+          payload = JSON.parse(xhr.responseText) as unknown
+        } catch {
+          payload = null
+        }
+      }
+
+      if (xhr.status === 404 || xhr.status === 405) {
+        reject(new LogoUploadUnavailableError())
+        return
+      }
+
+      if (xhr.status < 200 || xhr.status >= 300) {
+        const record = asRecord(payload)
+        const message =
+          (record !== null ? readString(record, 'detail', 'error', 'message') : null) ??
+          `Upload failed (${String(xhr.status)})`
+        reject(new ApiError(message, xhr.status, record === null ? payload : record.detail))
+        return
+      }
+
+      // The response may be the logo, or an envelope around it.
+      const record = asRecord(payload)
+      const logo =
+        parseBrandLogo(payload) ??
+        (record === null ? null : parseBrandLogo(record.logo ?? record.data ?? record.item))
+      if (logo === null) {
+        reject(new ApiError('The server did not return a usable logo.', xhr.status, payload))
+        return
+      }
+      onProgress?.(1)
+      resolve(logo)
+    }
+
+    xhr.send(form)
+  })
+}
+
+/** Deletes a stored logo. A 404 is treated as success: it is already gone. */
+export async function deleteLogo(logoId: string): Promise<void> {
+  try {
+    await request(`/logos/${encodeURIComponent(logoId)}`, { method: 'DELETE' })
+  } catch (cause) {
+    if (cause instanceof ApiError && cause.status === 404) return
+    throw cause
+  }
+}
+
 async function postJob(
   body: Record<string, unknown>,
 ): Promise<{ jobId: string; themeWarnings: string[] }> {
@@ -1081,6 +1396,26 @@ export class VoiceEngineMismatchError extends Error {
 }
 
 /**
+ * Thrown when the backend refuses our `logo_id`.
+ *
+ * Never retried without the field, and this is the sharpest case of that rule in
+ * the codebase. Stripping `logo_id` always *succeeds*, and the job that comes
+ * back has the built-in mark burnt into the bottom-left corner of every frame —
+ * either instead of the customer's logo, or in place of the "no logo" the user
+ * deliberately chose. Both are a different video from the one requested, and the
+ * user would have no way to tell from the form.
+ */
+export class LogoRejectedError extends Error {
+  readonly rejection: LogoRejection
+
+  constructor(rejection: LogoRejection) {
+    super(rejection.message)
+    this.name = 'LogoRejectedError'
+    this.rejection = rejection
+  }
+}
+
+/**
  * Creates a job, degrading gracefully if the backend has not caught up.
  *
  * Two different 422s have to be told apart here:
@@ -1101,6 +1436,10 @@ export async function createJob(body: CreateJobRequest): Promise<CreateJobRespon
   // would serialise away anyway, but dropping the key keeps the payload clean
   // and keeps `field in full` honest below.
   if (body.theme_custom === undefined) delete full.theme_custom
+  // Omitting `logo_id` is meaningful — it is how the backend is told to use its
+  // configured default mark — so an undefined one is removed rather than sent as
+  // JSON `null`, which an older `JobCreate` would read as a bad string.
+  if (body.logo_id === undefined) delete full.logo_id
 
   try {
     const { jobId, themeWarnings } = await postJob(full)
@@ -1115,6 +1454,12 @@ export async function createJob(body: CreateJobRequest): Promise<CreateJobRespon
     // answered with a successful render in the wrong voice.
     const mismatch = parseVoiceEngineMismatch(cause.detail)
     if (mismatch !== null) throw new VoiceEngineMismatchError(mismatch)
+
+    // Same reasoning, one step further: a logo 422 is only ever surfaced.
+    // Checked whether or not we sent the field, because `extra_forbidden` on a
+    // backend that has never heard of `logo_id` is exactly this error.
+    const logoRejection = parseLogoRejection(cause.detail, body.logo_id ?? null)
+    if (logoRejection !== null) throw new LogoRejectedError(logoRejection)
 
     const optional = OPTIONAL_JOB_FIELDS.filter((field) => field in full)
     if (optional.length === 0) throw cause

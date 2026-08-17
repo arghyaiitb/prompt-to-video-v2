@@ -20,6 +20,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlmodel import Session, desc, select
 
+from app.api.logos import NO_LOGO, logo_exists
 from app.api.themes import (
     PALETTE_FIELDS,
     ThemeCustom,
@@ -31,7 +32,12 @@ from app.api.themes import (
 from app.api.voices import engine_for_voice
 from app.core.config import get_settings
 from app.core.models import JobStatus
-from app.db.models import CUSTOM_THEME_NAME, DEFAULT_BULLETS_PER_SLIDE, FALLBACK_TTS_ENGINE, Job
+from app.db.models import (
+    CUSTOM_THEME_NAME,
+    DEFAULT_BULLETS_PER_SLIDE,
+    FALLBACK_TTS_ENGINE,
+    Job,
+)
 from app.db.session import get_session
 from app.worker import factory
 
@@ -75,6 +81,20 @@ class JobCreate(BaseModel):
 
     tone: Tone | None = None
 
+    logo_id: str | None = Field(default=None, max_length=64)
+    """Brand mark for this video — an id from POST /api/logos.
+
+    Three inputs, three outcomes, because "say nothing" and "say no logo" are different
+    requests:
+
+    * omitted / null — the bundled default mark, exactly as every job behaved before
+      uploads existed;
+    * ``"none"`` — no branding at all;
+    * an id — that upload. An id the store does not have is a 422 naming it, never a
+      silent fallback: branding is burned into the pixels, so a video that came back
+      unbranded after the client asked for a logo cannot be corrected without a re-render.
+    """
+
 
 class JobCreated(BaseModel):
     job_id: str
@@ -109,6 +129,13 @@ class JobStatusOut(BaseModel):
 
     voice: str
     """The resolved voice — an omitted one is filled in from the engine's default."""
+
+    logo_id: str | None = None
+    """`null` = the bundled default mark, `"none"` = no branding, otherwise the upload id."""
+
+    logo_url: str | None = None
+    """Where to fetch the chosen mark, when there is one to fetch. `null` for both the
+    default mark and for `"none"`, so a UI never has to special-case the sentinel."""
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -145,7 +172,45 @@ def _to_out(job: Job) -> JobStatusOut:
         tone=job.tone,
         tts_engine=job.tts_engine or FALLBACK_TTS_ENGINE,
         voice=job.voice or "",
+        logo_id=job.logo_id,
+        logo_url=_logo_url(job.logo_id),
     )
+
+
+def _logo_url(logo_id: str | None) -> str | None:
+    """The fetchable URL for a job's mark, or None for the default and for `none`."""
+    if not logo_id or logo_id == NO_LOGO:
+        return None
+    return f"/api/logos/{logo_id}"
+
+
+def _resolve_logo_id(requested: str | None) -> str | None:
+    """Normalise `logo_id`, or 422 on an id the store does not have.
+
+    Unlike `theme` and `tts_engine`, an unknown value is NOT normalised to the default.
+    Those two degrade to something that still looks deliberate; a missing logo degrades to
+    a video branded with somebody else's mark, which is the one outcome an upload feature
+    exists to prevent.
+    """
+    logo_id = (requested or "").strip()
+    if not logo_id:
+        return None
+    if logo_id.lower() == NO_LOGO:
+        return NO_LOGO
+    if not logo_exists(logo_id):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "unknown_logo",
+                "message": (
+                    f"logo_id {logo_id!r} is not in the logo store; upload it with "
+                    f"POST /api/logos, pass {NO_LOGO!r} for no branding, or omit the field "
+                    "for the default mark"
+                ),
+                "logo_id": logo_id,
+            },
+        )
+    return logo_id
 
 
 def _resolve_theme_name(requested: str | None) -> str:
@@ -297,6 +362,7 @@ async def create_job(payload: JobCreate, session: SessionDep) -> JobCreated:
         ),
         bullets_per_slide=payload.bullets_per_slide,
         tone=payload.tone,
+        logo_id=_resolve_logo_id(payload.logo_id),
         status=JobStatus.QUEUED.value,
         progress=0,
         current_stage=JobStatus.QUEUED.value,

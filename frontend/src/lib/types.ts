@@ -80,6 +80,16 @@ export interface ThemePreset {
    * absent), so the UI falls back to computing them from `swatches`.
    */
   contrast: Partial<Record<ContrastPairId, number>>
+  /**
+   * `Theme.logo_opacity` — the opacity the brand mark composites at, 0.85 by
+   * default and 0.92 on every light preset.
+   *
+   * `list_themes()` does not serialise it today, so it is normally absent and
+   * `logoOpacityFor` derives it from `is_light`. Parsed anyway because `ThemeOut`
+   * is `extra="allow"`, so the server can start sending it without a client
+   * change — and the mark's real contrast depends on it.
+   */
+  logo_opacity?: number
 }
 
 /** Sentinel `theme` value meaning "the palette is in `theme_custom`". */
@@ -99,6 +109,95 @@ export interface ThemeContrastFailure {
   contrast: Partial<Record<ContrastPairId, number>>
   suggestedFix: Palette | null
   suggestedContrast: Partial<Record<ContrastPairId, number>>
+}
+
+/* ------------------------------------------------------------------ *
+ * Brand logos — `POST/GET/DELETE /api/logos`
+ *
+ * The endpoint is being written concurrently, so every field below is optional
+ * and every parser tolerates its absence. The renderer's side of the contract is
+ * settled and measured, and lives in `lib/logo.ts`.
+ * ------------------------------------------------------------------ */
+
+export interface BrandLogo {
+  /** What `POST /api/jobs` wants in `logo_id`. */
+  id: string
+  /** Where to fetch the file — normally `/api/logos/{id}`. */
+  url: string
+  /** Source pixel dimensions, when the server measured them. */
+  width: number | null
+  height: number | null
+  /** `png`, `svg`, … lowercased. */
+  format: string | null
+  /**
+   * Whether the stored file carries an alpha channel. `null` means the server
+   * did not say — not "no". An opaque mark composites as a solid rectangle, so
+   * the difference matters enough not to guess.
+   */
+  has_alpha: boolean | null
+  /**
+   * Server-side caveat, e.g. an SVG containing constructs its rasteriser cannot
+   * reproduce. Surfaced verbatim: the backend knows things about its own
+   * ImageMagick build that the browser cannot check.
+   */
+  warning: string | null
+  original_filename: string | null
+  bytes: number | null
+  created_at: string | null
+}
+
+/**
+ * UI-only sentinel for "use the built-in mark".
+ *
+ * Never sent: `logo_id` is *omitted* from the request instead, which is what the
+ * backend documents as "fall back to the configured default"
+ * (`Timeline.logo_path = None`). Deliberately unlikely to collide with a real
+ * server-issued id.
+ */
+export const BUILT_IN_LOGO_ID = '__built_in__'
+
+/**
+ * The value that means "no brand mark at all", pending the backend's decision
+ * between this spelling and another. `parseLogoCatalogue` overrides it with
+ * whatever the server reports, and a rejection of it is surfaced rather than
+ * retried — silently reinstating the built-in mark would ship branding the user
+ * explicitly removed.
+ */
+export const DEFAULT_NO_LOGO_VALUE = 'none'
+
+/** What the picker holds. `BUILT_IN_LOGO_ID`, the no-logo value, or a logo id. */
+export type LogoSelection = string
+
+export interface LogoCatalogue {
+  logos: BrandLogo[]
+  /**
+   * False when `/api/logos` does not exist yet (or is unreachable). The form
+   * keeps working with the built-in mark and says uploads are unavailable.
+   */
+  available: boolean
+  /** The server's own spelling of "no logo", when it volunteers one. */
+  noneValue: string
+}
+
+/**
+ * The backend refusing our `logo_id`.
+ *
+ * Never folded into the generic strip-and-retry. Dropping `logo_id` and
+ * retrying succeeds — and renders the built-in mark, which is a *different
+ * video* from the one requested, whether the user picked their own logo or
+ * explicitly asked for none. The lesson from the engine work: a generic retry
+ * that strips fields silently renders something nobody asked for.
+ */
+export interface LogoRejection {
+  message: string
+  /** The value we sent, for the message. */
+  logoId: string | null
+  /**
+   * True when the server does not know the field at all — a pydantic
+   * `extra_forbidden`, or an explicit "unsupported". The fix is to switch to the
+   * built-in mark, not to pick a different logo.
+   */
+  unsupported: boolean
 }
 
 export interface Voice {
@@ -279,7 +378,14 @@ export const MIN_BULLETS = 3
 export const MAX_BULLETS = 5
 export const DEFAULT_BULLETS = 4
 
-/** Fields the backend may not accept yet — dropped on a 422 retry. */
+/**
+ * Fields the backend may not accept yet — dropped on a 422 retry.
+ *
+ * `logo_id` is deliberately **not** here. Every other field on this list
+ * degrades to a different-looking video the user can still recognise as theirs;
+ * dropping `logo_id` stamps someone else's mark on it, or reinstates a mark they
+ * removed. That one is surfaced instead — see `LogoRejectedError`.
+ */
 export const OPTIONAL_JOB_FIELDS = [
   'theme',
   'theme_custom',
@@ -331,6 +437,14 @@ export interface CreateJobRequest {
   bullets_per_slide: number
   /** Audience the script should be written for. */
   tone: Tone
+  /**
+   * Uploaded logo id, or the server's "no logo" value.
+   *
+   * **Omitted** means the built-in mark — that is the backend's own default, not
+   * a shortcut. Absent from `OPTIONAL_JOB_FIELDS` on purpose: see
+   * `LogoRejection`.
+   */
+  logo_id?: string
 }
 
 export interface CreateJobResponse {
@@ -385,6 +499,17 @@ export interface Job {
   theme_custom?: Palette | null
   bullets_per_slide?: number | null
   tone?: string | null
+  /**
+   * The brand mark this job was rendered with.
+   *
+   * Three states, and they are genuinely different:
+   * - `undefined` — the backend does not report the field. Show nothing rather
+   *   than claiming a mark for jobs rendered before the choice existed.
+   * - `null` — reported as empty, which the backend documents as "fall back to
+   *   the configured default", i.e. the built-in mark.
+   * - a string — an uploaded logo id, or the server's "no logo" value.
+   */
+  logo_id?: string | null
 }
 
 /* ------------------------------------------------------------------ *

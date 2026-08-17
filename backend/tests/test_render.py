@@ -2006,31 +2006,33 @@ def test_the_derived_upscale_removes_the_zoompan_stepping(assets, tmp_path):
     derived = FFmpegBackend(text_mode="scrim").render_scene(
         assets["landscape"], plan, "", pan_seconds, tmp_path / "derived.mp4", profile
     )
-    # The control: force the canvas back to the region, i.e. no sub-pixel headroom.
-    flat = FFmpegBackend(text_mode="scrim")
-    flat_profile = profile.model_copy()
-    original = upscale_factors
-
+    # The control: force the canvas back to the region, i.e. no sub-pixel headroom at all.
     import app.render.ffmpeg_backend as backend_module
 
-    backend_module.upscale_factors = lambda *a, **k: (1, 1, 1)
+    original = backend_module.motion_canvas
+    region_only = backend_module.MotionCanvas(
+        fit=(profile.width, profile.height),
+        canvas=(profile.width, profile.height),
+        detail=1,
+    )
+    backend_module.motion_canvas = lambda *a, **k: region_only
     try:
-        none = flat.render_scene(
-            assets["landscape"], plan, "", pan_seconds, tmp_path / "flat.mp4", flat_profile
+        none = FFmpegBackend(text_mode="scrim").render_scene(
+            assets["landscape"], plan, "", pan_seconds, tmp_path / "flat.mp4", profile
         )
     finally:
-        backend_module.upscale_factors = original
+        backend_module.motion_canvas = original
 
     without, with_headroom = _duplicate_ratio(none), _duplicate_ratio(derived)
     assert without > 0.2, f"expected gross stepping with no headroom, got {without:.3f}"
     assert with_headroom < without / 2, (
         f"derived canvas did not help: {with_headroom:.3f} vs {without:.3f}"
     )
-    # And the derivation actually asked for headroom on the travel axis only.
-    horizontal, vertical, _ = upscale_factors(
+    # And the derivation put the headroom on the travel axis, not both.
+    sizing = motion_canvas(
         plan, region, int(pan_fps * pan_seconds), profile, src_size=(640, 360)
     )
-    assert horizontal >= vertical
+    assert sizing.canvas[0] / region.width >= sizing.canvas[1] / region.height
 
 
 def _pixel(frame: Path, x: int, y: int) -> tuple[int, int, int]:
@@ -2300,37 +2302,74 @@ def test_a_clip_that_already_fills_the_scene_is_not_looped():
     assert "split=" not in graph
 
 
-def test_a_clip_stretched_over_full_bleed_is_flagged_as_an_upscale(caplog):
-    """1280x720 is ample for an ~857px panel and 1.5x short of 1080p full bleed."""
-    hero = layout_region(VisualPlan(layout=SlideLayout.HERO_RIGHT), HD)
-    bleed = layout_region(VisualPlan(layout=SlideLayout.FULL_BLEED), HD)
-
+@pytest.mark.parametrize(
+    ("layout", "factor"),
+    [
+        # Measured. A 720p clip has to be *upscaled* for every layout at 1080p -- including
+        # the hero panel, which is only 720 wide but 900 tall, so it is the panel's height
+        # and not its width that runs out of pixels. Worth pinning: "1280x720 into an ~857px
+        # region is plenty" is the intuition, and it is wrong.
+        (SlideLayout.HERO_RIGHT, "1.25x"),
+        (SlideLayout.IMAGE_BAND, "1.50x"),
+        (SlideLayout.FULL_BLEED, "1.50x"),
+    ],
+)
+def test_a_clip_that_cannot_fill_its_region_is_flagged_as_an_upscale(caplog, layout, factor):
+    region = layout_region(VisualPlan(layout=layout), HD)
     with caplog.at_level("WARNING"):
-        FFmpegBackend._warn_if_clip_is_upscaled(
-            (1280, 720), hero, VisualPlan(layout=SlideLayout.HERO_RIGHT)
-        )
-    assert not [r for r in caplog.records if "upscale" in r.message]
+        FFmpegBackend._warn_if_clip_is_upscaled((1280, 720), region, VisualPlan(layout=layout))
+    warnings = [r.getMessage() for r in caplog.records if "upscale" in r.getMessage()]
+    assert warnings, f"{layout.value} needs a {factor} upscale and must not pass silently"
+    assert factor in warnings[0], warnings[0]
 
+
+def test_a_clip_with_pixels_to_spare_is_not_flagged(caplog):
+    """At draft resolution the same clip is a downscale everywhere, so nothing is said."""
+    draft = RenderProfile.draft()
+    for layout in (SlideLayout.HERO_RIGHT, SlideLayout.IMAGE_BAND, SlideLayout.FULL_BLEED):
+        region = layout_region(VisualPlan(layout=layout), draft)
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            FFmpegBackend._warn_if_clip_is_upscaled(
+                (1280, 720), region, VisualPlan(layout=layout)
+            )
+        assert not [r for r in caplog.records if "upscale" in r.getMessage()], layout
+    # And an unprobeable clip says nothing rather than dividing by zero.
     caplog.clear()
     with caplog.at_level("WARNING"):
-        FFmpegBackend._warn_if_clip_is_upscaled(
-            (1280, 720), bleed, VisualPlan(layout=SlideLayout.FULL_BLEED)
-        )
-    warnings = [r.message for r in caplog.records if "upscale" in r.message]
-    assert warnings, "a 1.5x upscale over the whole frame must not pass silently"
-    assert "1.50x" in warnings[0]
+        FFmpegBackend._warn_if_clip_is_upscaled((0, 0), region, VisualPlan())
+    assert not caplog.records
 
 
-def test_render_all_accepts_a_scene_whose_visual_is_a_clip():
-    """The validation gate must not demand an image_path when video_path is set."""
+def test_render_all_rejects_a_scene_with_neither_a_still_nor_a_clip(tmp_path):
+    """The validation gate must name both options now that there are two."""
     from app.render.ffmpeg_backend import RenderError
 
     timeline = make_timeline([5.0])
     timeline.scenes[0].plan = VisualPlan(layout=SlideLayout.HERO_RIGHT)
-    backend = FFmpegBackend(text_mode="scrim")
 
     with pytest.raises(RenderError, match="image_path or video_path"):
-        backend.render_all(timeline, Path("/nonexistent-dir-for-validation"))
+        FFmpegBackend(text_mode="scrim").render_all(timeline, tmp_path)
+
+
+@integration
+@needs_veo
+def test_render_all_accepts_a_scene_whose_visual_is_only_a_clip(tmp_path):
+    """A clip scene has no image_path at all, and that must be allowed through."""
+    profile = RenderProfile(width=320, height=180, fps=30, upscale_factor=2, crf=28)
+    timeline = make_timeline([5.0])
+    timeline.scenes[0].plan = VisualPlan(
+        layout=SlideLayout.HERO_RIGHT, motion=Motion.ZOOM_IN,
+        transition_in=Transition.CUT, transition_duration=0.0,
+    )
+    timeline.scenes[0].image_path = None
+    timeline.scenes[0].video_path = str(VEO_CLIP)
+    timeline.profile = profile
+
+    rendered = FFmpegBackend(text_mode="scrim").render_all(timeline, tmp_path)
+    clip = Path(rendered.scenes[0].clip_path)
+    assert clip.is_file()
+    assert ff.count_frames(clip) == frames_for(5.0, profile.fps)
 
 
 @integration
@@ -2409,9 +2448,14 @@ def test_a_looped_clip_never_freezes_and_never_repeats_a_frame_at_the_seam(tmp_p
     # 24 -> 30 fps repeats one frame in five, so ~0.20 is the floor for any clip scene.
     assert ratio < 0.34, f"the scene freezes or judders somewhere: {ratio:.3f}"
 
-    # Nothing is held for anywhere near the 12s a final-frame hold would freeze for.
-    stderr = ff.run([
-        ff.ffmpeg_bin(), "-hide_banner", "-nostdin", "-i", str(clip),
-        "-vf", f"{EVALUATOR_MPDECIMATE},fps_mode=passthrough", "-f", "null", "-",
-    ])
-    assert stderr is not None
+    # And specifically: nothing is frozen *past the 8s mark*, which is exactly where a
+    # final-frame hold would park for the remaining 12 seconds.
+    def frame_at(when: float) -> bytes:
+        png = tmp_path / f"probe{when:.2f}.png"
+        ff.ffmpeg(["-ss", f"{when:.3f}", "-i", clip, "-frames:v", "1", "-update", "1", png])
+        return png.read_bytes()
+
+    for when in (9.0, 11.0, 13.0, 15.0, 17.0, 19.0):
+        assert frame_at(when) != frame_at(when + 0.5), (
+            f"the picture is identical at {when}s and {when + 0.5}s -- it has frozen"
+        )
