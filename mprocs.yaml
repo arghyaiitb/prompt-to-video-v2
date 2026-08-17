@@ -1,0 +1,35 @@
+# Single command to run the whole stack, from the repo root:
+#
+#     mprocs
+#
+# Keys: <tab>/arrows switch panes · <s> start · <x> stop · <r> restart · <q> quit
+#
+# NOTE: `cwd` is resolved against the directory mprocs is LAUNCHED from, not the
+# config's location (mprocs 0.8.3 has no <CONFIG_DIR> placeholder — verified).
+# Run this from the repo root, or use `scripts/dev.sh` which cd's for you.
+
+procs:
+  backend:
+    shell: "uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000"
+    cwd: "backend"
+    autostart: true
+
+  frontend:
+    shell: "pnpm dev --port 5173 --strictPort"
+    cwd: "frontend"
+    autostart: true
+
+  # On-demand panes — press <s> in the pane to run.
+  tests:
+    shell: "uv run pytest -q"
+    cwd: "backend"
+    autostart: false
+
+  lint:
+    shell: "uv run ruff check app/ && pnpm --dir ../frontend exec tsc --noEmit"
+    cwd: "backend"
+    autostart: false
+
+  doctor:
+    shell: "./scripts/doctor.sh"
+    autostart: false
