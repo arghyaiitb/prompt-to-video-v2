@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "typecheck": "tsc -b --force",
     "lint": "oxlint",
+    "test:contrast": "tsc src/lib/contrast.ts src/lib/contrast.test.ts --ignoreConfig --outDir node_modules/.tmp/contrast-test --module commonjs --moduleResolution node --ignoreDeprecations 6.0 --target es2022 --strict --skipLibCheck && node node_modules/.tmp/contrast-test/contrast.test.js",
     "preview": "vite preview"
   },
   "dependencies": {

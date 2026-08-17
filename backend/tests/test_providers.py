@@ -21,6 +21,7 @@ Artifacts go to pytest's tmp_path, never into the repo.
 from __future__ import annotations
 
 import base64
+import inspect
 import json
 import os
 import subprocess
@@ -28,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from app.core.models import Motion, Word
+from app.core.models import Motion, SceneRole, SceneScript, Word
 from app.core.ports import (
     Aligner,
     ImageProvider,
@@ -58,7 +59,31 @@ from app.providers import (
     normalize,
     tokenize,
 )
-from app.providers.gemini_script import _split_into_segments
+from app.providers.bullet_timing import (
+    LEAD,
+    TAIL_GUARD,
+    anchor_position,
+    find_anchors,
+    time_bullets,
+)
+from app.providers.gemini_script import (
+    BULLET_CHAR_MAX,
+    BULLET_DEFAULT,
+    BULLET_MIN,
+    HEADING_CHAR_MAX,
+    STRUCTURE_FROM_SLIDES,
+    SUMMARY_FROM_SLIDES,
+    TITLE_CHAR_MAX,
+    TONE_CLAUSES,
+    StructuredSceneScript,
+    _split_into_segments,
+    narration_words,
+    role_bullet_target,
+    role_plan,
+    scene_clip_prompt,
+    scene_role,
+    words_spoken_in,
+)
 
 LIVE = os.environ.get("RUN_LIVE_API") == "1"
 live_only = pytest.mark.skipif(not LIVE, reason="set RUN_LIVE_API=1 to hit real APIs")
@@ -219,14 +244,23 @@ class TestGeminiScriptProvider:
         assert schema["properties"]["scenes"]["items"]["type"] == "OBJECT"
         motion = schema["properties"]["scenes"]["items"]["properties"]["motion"]
         assert motion["enum"] == [m.value for m in Motion]
-        # Every SceneScript field must be required or the model omits it.
+        # The role drives duration, layout and bullet budget, so it is an enum like motion
+        # rather than a free string that could come back as prose.
+        role = schema["properties"]["scenes"]["items"]["properties"]["role"]
+        assert role["enum"] == [r.value for r in SceneRole]
+        # Every scene field must be required or the model omits it.
         assert set(schema["properties"]["scenes"]["items"]["required"]) == {
             "id",
+            "role",
             "narration",
             "heading",
+            "bullets",
             "image_prompt",
+            "clip_prompt",
             "motion",
         }
+        bullets = schema["properties"]["scenes"]["items"]["properties"]["bullets"]
+        assert bullets == {"type": "ARRAY", "items": {"type": "STRING"}}
 
     def test_prompt_states_the_slide_count_and_no_text_rule(self, monkeypatch):
         captured: dict = {}
@@ -377,6 +411,694 @@ class TestVerbatimScriptProvider:
     def test_single_scene_keeps_whole_text(self):
         script = VerbatimScriptProvider(VERBATIM_TEXT).generate("b", 1)
         assert script.scenes[0].narration.split() == VERBATIM_TEXT.split()
+
+
+class TestSceneBullets:
+    """Bullets must arrive anchored: a point with no phrase in its own narration cannot
+    be timed, so both providers guarantee the anchor rather than hoping for it."""
+
+    BULLET_NARRATION = (
+        "Check the sender domain before you trust the display name. Hover over every link "
+        "to reveal the real destination it points to. Report anything suspicious to the "
+        "security team straight away."
+    )
+
+    def _generate(self, monkeypatch, bullets, narration=None, bullets_per_slide=4):
+        scene = _scene(1, narration=narration or self.BULLET_NARRATION)
+        scene["bullets"] = bullets
+        monkeypatch.setattr(
+            "app.providers.gemini_script.generate_content",
+            lambda *a, **k: _script_response([scene]),
+        )
+        return (
+            GeminiScriptProvider(api_key="x")
+            .generate("phishing", 1, bullets_per_slide=bullets_per_slide)
+            .scenes[0]
+        )
+
+    def test_prompt_demands_anchored_bullets_and_a_topical_image(self, monkeypatch):
+        captured: dict = {}
+
+        def fake(model, body, api_key, **kwargs):
+            captured["text"] = body["contents"][0]["parts"][0]["text"]
+            return _script_response([_scene(1)])
+
+        monkeypatch.setattr("app.providers.gemini_script.generate_content", fake)
+        GeminiScriptProvider(api_key="x").generate("how phishing attacks work", 4)
+        prompt = captured["text"]
+        assert "CONSECUTIVE CONTENT WORDS" in prompt
+        assert "SAME ORDER" in prompt
+        # The content scene's pacing contract, from docs/DIRECTION.md §1.2.
+        assert "narration 34 words (25-43)" in prompt
+        assert "EXACTLY 4 short on-screen points" in prompt
+        # The observed defect: a generic atrium for a security video.
+        assert "VIDEO'S TOPIC" in prompt
+        assert "how phishing attacks work" in prompt
+        assert "atrium" in prompt
+        assert "No text, no letters" in prompt
+
+    def test_model_bullets_are_carried_through(self, monkeypatch):
+        given = ["Check The Sender Domain", "Reveal The Real Destination"]
+        scene = self._generate(
+            monkeypatch, given + ["Report Anything Suspicious"], bullets_per_slide=3
+        )
+        assert scene.bullets[:2] == given
+
+    def test_glyphs_markdown_and_terminal_periods_are_stripped(self, monkeypatch):
+        scene = self._generate(
+            monkeypatch,
+            ["- Check the sender domain.", "**Hover over every link**", "3. Report anything!"],
+            bullets_per_slide=3,
+        )
+        assert scene.bullets == [
+            "Check the sender domain",
+            "Hover over every link",
+            "Report anything",
+        ]
+
+    def test_bullets_are_reordered_to_follow_the_narration(self, monkeypatch):
+        scene = self._generate(
+            monkeypatch,
+            ["Report Anything Suspicious", "Check The Sender Domain", "Hover Over Every Link"],
+            bullets_per_slide=3,
+        )
+        assert scene.bullets == [
+            "Check The Sender Domain",
+            "Hover Over Every Link",
+            "Report Anything Suspicious",
+        ]
+
+    def test_shortfall_is_topped_up_from_the_narration(self, monkeypatch):
+        scene = self._generate(monkeypatch, ["Check The Sender Domain"])
+        assert len(scene.bullets) >= 3
+        for bullet in scene.bullets:
+            assert anchor_position(bullet, scene.narration) is not None, bullet
+
+    def test_missing_bullets_field_still_yields_anchored_bullets(self, monkeypatch):
+        scene = self._generate(monkeypatch, None)
+        assert 3 <= len(scene.bullets) <= 5
+        for bullet in scene.bullets:
+            assert anchor_position(bullet, scene.narration) is not None, bullet
+
+    def test_over_delivery_is_capped_at_the_content_budget(self, monkeypatch):
+        """A content slide shows four points however many the model sends.
+
+        `docs/DIRECTION.md` §9 fixes `CONTENT.bullet_budget` at 4: at the 11s duration floor
+        the usable reveal window is 6.27s and five points need 6.4s at the spec stagger.
+        """
+        anchored = [
+            "Check The Sender Domain",
+            "Trust The Display Name",
+            "Hover Over Every Link",
+            "Reveal The Real Destination",
+            "Report Anything Suspicious",
+            "Security Team Straight Away",
+            "Points To",
+        ]
+        scene = self._generate(monkeypatch, anchored, bullets_per_slide=5)
+        budget = SceneRole.CONTENT.bullet_budget
+        assert len(scene.bullets) == budget
+        assert scene.bullets == anchored[:budget]
+
+    def test_unanchored_bullets_yield_to_phrases_from_the_narration(self, monkeypatch):
+        scene = self._generate(monkeypatch, [f"Abstract Point {i}" for i in range(4)])
+        assert 3 <= len(scene.bullets) <= 5
+        for bullet in scene.bullets:
+            assert "Abstract Point" not in bullet
+            assert anchor_position(bullet, scene.narration) is not None, bullet
+
+    def test_an_unanchored_bullet_survives_when_it_is_needed_to_reach_three(self, monkeypatch):
+        # Short narration yields few derivable phrases; content is not silently lost.
+        scene = self._generate(
+            monkeypatch,
+            ["Check The Sender Domain", "Zero Trust Posture"],
+            narration="Check the sender domain first.",
+        )
+        assert "Zero Trust Posture" in scene.bullets
+
+    def test_duplicates_are_dropped(self, monkeypatch):
+        scene = self._generate(
+            monkeypatch, ["Check The Sender Domain", "check the sender domain"]
+        )
+        assert len([b for b in scene.bullets if "sender" in b.lower()]) == 1
+
+    @pytest.mark.parametrize("count", [1, 2, 3])
+    def test_verbatim_provider_derives_anchored_bullets(self, count):
+        script = VerbatimScriptProvider(VERBATIM_TEXT).generate("bridges", count)
+        for scene in script.scenes:
+            # A segment shorter than the 35-55 word narration target carries fewer points
+            # by design: the alternative is scraps like "Check The".
+            assert 2 <= len(scene.bullets) <= 5, scene.bullets
+            for bullet in scene.bullets:
+                assert 2 <= len(bullet.split()) <= 6, bullet
+                assert not bullet.endswith(".")
+                assert anchor_position(bullet, scene.narration) is not None, bullet
+
+    def test_narration_of_the_target_length_yields_three_points(self):
+        scene = (
+            VerbatimScriptProvider(self.BULLET_NARRATION)
+            .generate("phishing", 1, bullets_per_slide=3)
+            .scenes[0]
+        )
+        assert len(scene.bullets) == 3, scene.bullets
+
+    def test_split_scenes_keep_the_bullets_their_own_half_says(self, monkeypatch):
+        long_narration = (
+            "Check the sender domain before you trust the display name shown in your "
+            "inbox. Report anything suspicious to the security team straight away."
+        )
+        scene = _scene(1, narration=long_narration)
+        scene["bullets"] = ["Check The Sender Domain", "Report Anything Suspicious"]
+        monkeypatch.setattr(
+            "app.providers.gemini_script.generate_content",
+            lambda *a, **k: _script_response([scene]),
+        )
+        script = GeminiScriptProvider(api_key="x").generate("phishing", 2)
+        assert len(script.scenes) == 2
+        assert "Check The Sender Domain" in script.scenes[0].bullets
+        assert "Report Anything Suspicious" in script.scenes[1].bullets
+        for part in script.scenes:
+            for bullet in part.bullets:
+                assert anchor_position(bullet, part.narration) is not None, (part.id, bullet)
+
+    def test_bullets_can_be_timed_against_aligned_words(self):
+        scene = VerbatimScriptProvider(self.BULLET_NARRATION).generate("phishing", 1).scenes[0]
+        tokens = scene.narration.split()
+        words = [Word(word=t, start=i * 0.4, end=i * 0.4 + 0.35) for i, t in enumerate(tokens)]
+        points = time_bullets(scene.bullets, words, 0.0, len(tokens) * 0.4 + 0.3)
+        assert [p.text for p in points] == scene.bullets
+        times = [p.appear_at for p in points]
+        assert times == sorted(times)
+        assert sum(p.emphasis for p in points) == 1
+
+
+class TestBulletBudgetAndTone:
+    """The two UI knobs — `bullets_per_slide` and `tone` — must reach the model and come
+    back honoured. Both were previously dropped between the API and the provider, so these
+    cover the whole path: the signature the pipeline inspects, the prompt text, and the
+    bullet count on the returned scenes.
+    """
+
+    NARRATION = (
+        "Check the sender domain before you trust the display name shown in your inbox. "
+        "Hover over every link to reveal the real destination it points to. Read the "
+        "greeting closely because a generic salutation is a warning sign. Watch for urgent "
+        "deadlines designed to rush your decision. Report anything suspicious to the "
+        "security team straight away."
+    )
+
+    def _prompt(self, monkeypatch, *, slide_count: int = 2, **kwargs) -> str:
+        """The prompt text the provider would send for `kwargs`."""
+        captured: dict = {}
+
+        def fake(model, body, api_key, **_):
+            captured["text"] = body["contents"][0]["parts"][0]["text"]
+            return _script_response([_scene(1, narration=self.NARRATION)])
+
+        monkeypatch.setattr("app.providers.gemini_script.generate_content", fake)
+        GeminiScriptProvider(api_key="x").generate("phishing", slide_count, **kwargs)
+        return captured["text"]
+
+    def _scene_for(self, monkeypatch, bullets, **kwargs):
+        scene = _scene(1, narration=self.NARRATION)
+        scene["bullets"] = bullets
+        monkeypatch.setattr(
+            "app.providers.gemini_script.generate_content",
+            lambda *a, **k: _script_response([scene]),
+        )
+        return GeminiScriptProvider(api_key="x").generate("phishing", 1, **kwargs).scenes[0]
+
+    # ------------------------------------------------------------- signature conformance
+
+    @pytest.mark.parametrize(
+        "factory",
+        [
+            lambda: GeminiScriptProvider(api_key="x"),
+            lambda: VerbatimScriptProvider(VERBATIM_TEXT),
+        ],
+    )
+    def test_signature_matches_the_protocol_exactly(self, factory):
+        """`pipeline._script_kwargs` inspects the real signature, so name, kind and
+        default all have to match the Protocol or the choices are silently dropped."""
+        provider = factory()
+        expected = inspect.signature(ScriptProvider.generate).parameters
+        actual = inspect.signature(provider.generate).parameters
+        # `self` is bound away on the instance method but present on the Protocol.
+        expected = {k: v for k, v in expected.items() if k != "self"}
+        assert list(actual) == list(expected)
+        for name, param in expected.items():
+            assert actual[name].kind is param.kind, name
+            assert actual[name].default == param.default, name
+        assert actual["bullets_per_slide"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert actual["tone"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert isinstance(provider, ScriptProvider)
+
+    @pytest.mark.parametrize(
+        "factory",
+        [
+            lambda: GeminiScriptProvider(api_key="x"),
+            lambda: VerbatimScriptProvider(VERBATIM_TEXT),
+        ],
+    )
+    def test_pipeline_passes_both_knobs_through(self, factory):
+        """The regression this whole change exists for: `_script_kwargs` used to return
+        {} and log "those choices are being dropped"."""
+        from app.db.models import Job
+        from app.worker.pipeline import _script_kwargs
+
+        job = Job(topic="phishing", slide_count=3, bullets_per_slide=5, tone="executives")
+        assert _script_kwargs(factory(), job) == {
+            "bullets_per_slide": 5,
+            "tone": "executives",
+        }
+
+    # ------------------------------------------------------------------ count in prompt
+
+    @pytest.mark.parametrize("count", [3, 4, 5])
+    def test_requested_bullet_count_reaches_the_prompt(self, monkeypatch, count):
+        """The knob reaches the prompt, capped by what a content slide may show.
+
+        `docs/DIRECTION.md` §9 caps CONTENT at four points, so a request for five is honoured
+        as four. Three is a deliberate, legal choice under that ceiling and survives.
+        """
+        prompt = self._prompt(monkeypatch, bullets_per_slide=count)
+        expected = role_bullet_target(SceneRole.CONTENT, count)
+        assert f"EXACTLY {expected} short on-screen points" in prompt
+        assert f"{expected - 1} is too few and {expected + 1} is too many" in prompt
+        # The old fixed range must be gone, not merely supplemented.
+        assert "3 to 5 short on-screen points" not in prompt
+
+    @pytest.mark.parametrize("count", [3, 4, 5])
+    def test_the_narration_word_budget_does_not_move_with_the_bullet_count(
+        self, monkeypatch, count
+    ):
+        """Audio is the clock, so a scene's word budget is its DURATION.
+
+        A content scene is 11-19s whatever it carries (`docs/DIRECTION.md` §1.2), so asking
+        for one fewer point buys a slower reveal, not a shorter scene. The word budget used
+        to scale with the bullet count, which made the same role two different lengths.
+        """
+        prompt = self._prompt(monkeypatch, bullets_per_slide=count)
+        low, target, high = narration_words(SceneRole.CONTENT)
+        assert f"narration {target} words ({low}-{high})" in prompt
+        assert "35-55 words" not in prompt
+
+    def test_every_role_in_the_plan_states_its_own_word_budget(self, monkeypatch):
+        prompt = self._prompt(monkeypatch, slide_count=SUMMARY_FROM_SLIDES)
+        for role in SceneRole:
+            low, target, high = narration_words(role)
+            assert f"role: {role.value} — narration {target} words ({low}-{high})" in prompt
+
+    @pytest.mark.parametrize("requested", [0, 1, 2, -7])
+    def test_counts_below_the_legible_range_are_clamped_up(self, monkeypatch, requested):
+        prompt = self._prompt(monkeypatch, bullets_per_slide=requested)
+        assert f"EXACTLY {BULLET_MIN} short on-screen points" in prompt
+
+    @pytest.mark.parametrize("requested", [6, 12, 400])
+    def test_counts_above_the_legible_range_are_clamped_down(self, monkeypatch, requested):
+        prompt = self._prompt(monkeypatch, bullets_per_slide=requested)
+        assert f"EXACTLY {SceneRole.CONTENT.bullet_budget} short on-screen points" in prompt
+
+    def test_a_nonsense_count_falls_back_to_the_default(self, monkeypatch):
+        prompt = self._prompt(monkeypatch, bullets_per_slide="lots")  # type: ignore[arg-type]
+        expected = role_bullet_target(SceneRole.CONTENT, BULLET_DEFAULT)
+        assert f"EXACTLY {expected} short on-screen points" in prompt
+
+    # ------------------------------------------------------------------- count honoured
+
+    @pytest.mark.parametrize("count", [3, 4, 5])
+    def test_returned_bullet_count_matches_the_request(self, monkeypatch, count):
+        """Enforced on the way back too — a model that miscounts must not overflow or
+        under-fill the panel the user sized, and must not exceed the role's budget."""
+        over_delivered = [
+            "Check The Sender Domain",
+            "Trust The Display Name",
+            "Hover Over Every Link",
+            "Reveal The Real Destination",
+            "Generic Salutation",
+            "Urgent Deadlines",
+            "Report Anything Suspicious",
+        ]
+        scene = self._scene_for(monkeypatch, over_delivered, bullets_per_slide=count)
+        assert len(scene.bullets) == role_bullet_target(SceneRole.CONTENT, count), scene.bullets
+
+    @pytest.mark.parametrize("count", [3, 4, 5])
+    def test_under_delivery_is_topped_up_to_the_requested_count(self, monkeypatch, count):
+        scene = self._scene_for(
+            monkeypatch, ["Check The Sender Domain"], bullets_per_slide=count
+        )
+        assert len(scene.bullets) == role_bullet_target(SceneRole.CONTENT, count), scene.bullets
+        for bullet in scene.bullets:
+            # Top-ups are verbatim runs of the narration, so they stay timeable.
+            assert anchor_position(bullet, scene.narration) is not None, bullet
+
+    def test_clamping_applies_to_the_returned_bullets_too(self, monkeypatch):
+        scene = self._scene_for(monkeypatch, None, bullets_per_slide=99)
+        assert len(scene.bullets) == SceneRole.CONTENT.bullet_budget
+
+    # ------------------------------------------------------------------------- tone
+
+    TONE_MARKERS = {
+        "new_hires": "brand-new hires",
+        "all_staff": "zero jargon",
+        "technical": "MECHANISM",
+        "executives": "business impact",
+    }
+
+    def test_every_documented_tone_has_a_clause(self):
+        assert set(TONE_CLAUSES) == {"new_hires", "all_staff", "technical", "executives"}
+
+    @pytest.mark.parametrize("tone", sorted(TONE_MARKERS))
+    def test_each_tone_injects_its_own_clause_and_no_others(self, monkeypatch, tone):
+        prompt = self._prompt(monkeypatch, tone=tone)
+        assert "AUDIENCE" in prompt
+        assert TONE_CLAUSES[tone] in prompt
+        assert self.TONE_MARKERS[tone] in prompt
+        for other, marker in self.TONE_MARKERS.items():
+            if other != tone:
+                assert marker not in prompt, (tone, other)
+
+    @pytest.mark.parametrize("tone", sorted(TONE_MARKERS))
+    def test_tone_clauses_change_the_instruction_not_just_an_adjective(self, tone):
+        """Each clause must tell the model something substantive about what to say."""
+        clause = TONE_CLAUSES[tone]
+        assert len(clause.split()) >= 40, tone
+        assert clause.startswith("AUDIENCE"), tone
+
+    @pytest.mark.parametrize("tone", [None, "", "casual", "Pirate", "  "])
+    def test_unknown_or_absent_tone_is_a_no_op(self, monkeypatch, tone):
+        """Byte-identical to the untoned prompt, so nothing regresses for callers that
+        never set a tone."""
+        baseline = self._prompt(monkeypatch)
+        assert self._prompt(monkeypatch, tone=tone) == baseline
+        assert "AUDIENCE" not in baseline
+
+    def test_tone_is_matched_case_and_space_insensitively(self, monkeypatch):
+        assert TONE_CLAUSES["technical"] in self._prompt(monkeypatch, tone="  Technical ")
+
+    def test_tone_and_count_compose(self, monkeypatch):
+        prompt = self._prompt(monkeypatch, bullets_per_slide=3, tone="new_hires")
+        assert "EXACTLY 3 short on-screen points" in prompt
+        assert "narration 34 words (25-43)" in prompt
+        assert TONE_CLAUSES["new_hires"] in prompt
+
+    # -------------------------------------------------------------- verbatim provider
+
+    @pytest.mark.parametrize("count", [3, 4, 5])
+    def test_verbatim_provider_honours_the_bullet_budget(self, count):
+        scene = (
+            VerbatimScriptProvider(self.NARRATION)
+            .generate("phishing", 1, bullets_per_slide=count)
+            .scenes[0]
+        )
+        assert len(scene.bullets) == count, scene.bullets
+        for bullet in scene.bullets:
+            assert anchor_position(bullet, scene.narration) is not None, bullet
+
+    def test_verbatim_provider_never_cuts_scraps_to_hit_the_budget(self):
+        """A budget is a ceiling, not a quota: thin source text yields fewer points rather
+        than two-word fragments."""
+        scene = (
+            VerbatimScriptProvider("Check the sender domain first.")
+            .generate("phishing", 1, bullets_per_slide=5)
+            .scenes[0]
+        )
+        assert len(scene.bullets) < 5
+        for bullet in scene.bullets:
+            assert len(bullet.split()) >= 2, bullet
+
+    @pytest.mark.parametrize("tone", [None, "new_hires", "executives", "technical"])
+    def test_verbatim_provider_accepts_tone_and_ignores_it(self, tone):
+        """Documented asymmetry: it writes no prose of its own, so there is nothing for a
+        register to change. Accepting the argument keeps the Protocol satisfiable."""
+        script = VerbatimScriptProvider(VERBATIM_TEXT).generate("bridges", 3, tone=tone)
+        baseline = VerbatimScriptProvider(VERBATIM_TEXT).generate("bridges", 3)
+        assert script.model_dump() == baseline.model_dump()
+
+    def test_verbatim_narration_is_still_verbatim_at_every_budget(self):
+        for count in (3, 4, 5):
+            script = VerbatimScriptProvider(VERBATIM_TEXT).generate(
+                "bridges", 3, bullets_per_slide=count, tone="executives"
+            )
+            rejoined = " ".join(s.narration for s in script.scenes)
+            assert rejoined.split() == VERBATIM_TEXT.split(), count
+
+
+class TestScriptStructure:
+    """The video's SHAPE: a short title card, teaching scenes, an optional recap, an ending.
+
+    Every number asserted here comes from `docs/DIRECTION.md` — §1.1 for the role sequence
+    per slide count, §1.2 for the per-role word and bullet budgets, §9 for the corrections
+    to the committed `SceneRole` values. Where DIRECTION and the older calibration disagree,
+    DIRECTION wins; these tests are what pins that down.
+    """
+
+    NARRATION = TestBulletBudgetAndTone.NARRATION
+
+    # docs/DIRECTION.md §1.1, transcribed. T=title C=content S=summary X=closing.
+    DIRECTION_TABLE = {
+        4: "TCCX",
+        5: "TCCCX",
+        6: "TCCCCX",
+        7: "TCCCCSX",
+        8: "TCCCCCSX",
+        9: "TCCCCCCSX",
+        10: "TCCCCCCCSX",
+    }
+
+    def _prompt(self, monkeypatch, slide_count: int, **kwargs) -> str:
+        captured: dict = {}
+
+        def fake(model, body, api_key, **_):
+            captured["text"] = body["contents"][0]["parts"][0]["text"]
+            return _script_response([_scene(1, narration=self.NARRATION)])
+
+        monkeypatch.setattr("app.providers.gemini_script.generate_content", fake)
+        GeminiScriptProvider(api_key="x").generate("phishing", slide_count, **kwargs)
+        return captured["text"]
+
+    def _script(self, monkeypatch, scenes: list[dict], slide_count: int, **kwargs):
+        monkeypatch.setattr(
+            "app.providers.gemini_script.generate_content",
+            lambda *a, **k: _script_response(scenes),
+        )
+        return GeminiScriptProvider(api_key="x").generate("phishing", slide_count, **kwargs)
+
+    # -------------------------------------------------------------------------- the plan
+
+    @pytest.mark.parametrize("slide_count", sorted(DIRECTION_TABLE))
+    def test_the_plan_matches_the_direction_table(self, slide_count):
+        letters = {"title": "T", "content": "C", "summary": "S", "closing": "X"}
+        actual = "".join(letters[role.value] for role in role_plan(slide_count))
+        assert actual == self.DIRECTION_TABLE[slide_count]
+
+    @pytest.mark.parametrize("slide_count", range(STRUCTURE_FROM_SLIDES, 11))
+    def test_exactly_one_title_first_and_one_closing_last(self, slide_count):
+        plan = role_plan(slide_count)
+        assert plan[0] is SceneRole.TITLE
+        assert plan[-1] is SceneRole.CLOSING
+        assert plan.count(SceneRole.TITLE) == 1
+        assert plan.count(SceneRole.CLOSING) == 1
+
+    @pytest.mark.parametrize("slide_count", range(1, 11))
+    def test_summary_appears_only_from_the_spec_threshold_and_only_before_the_closing(
+        self, slide_count
+    ):
+        """DIRECTION §1.1 is explicit that a six-slide video does not get a recap either:
+        below ~100s there is nothing to recap and the closing already restates the point."""
+        plan = role_plan(slide_count)
+        summaries = [i for i, role in enumerate(plan) if role is SceneRole.SUMMARY]
+        if slide_count < SUMMARY_FROM_SLIDES:
+            assert summaries == []
+        else:
+            assert summaries == [len(plan) - 2], plan
+
+    @pytest.mark.parametrize("slide_count", [1, 2])
+    def test_below_the_structural_floor_the_ending_is_what_survives(self, slide_count):
+        """A two-scene video cannot hold all three parts. The title card is what gives:
+        stopping dead on the last content slide is the defect being fixed, and a title card
+        would be half the runtime."""
+        plan = role_plan(slide_count)
+        assert len(plan) == slide_count
+        assert SceneRole.TITLE not in plan
+        assert plan[-1] is (SceneRole.CLOSING if slide_count > 1 else SceneRole.CONTENT)
+
+    # ------------------------------------------------------------------------- budgets
+
+    @pytest.mark.parametrize("role", list(SceneRole))
+    def test_word_budgets_match_the_role_durations(self, role):
+        """The word budget IS the duration, so the two must not drift apart.
+
+        If someone retunes `SceneRole.target_duration` without retuning
+        `ROLE_NARRATION_WORDS`, the script would keep writing to the old pacing and every
+        scene would land at the wrong length. One word of slack for the doc's rounding.
+        """
+        low, target, high = narration_words(role)
+        min_seconds, max_seconds = role.target_duration
+        assert abs(low - words_spoken_in(min_seconds)) <= 1.0, role
+        assert abs(high - words_spoken_in(max_seconds)) <= 1.0, role
+        assert low <= target <= high, role
+
+    @pytest.mark.parametrize("role", list(SceneRole))
+    def test_the_bullet_knob_is_capped_by_every_roles_budget(self, role):
+        for requested in (0, 3, 4, 5, 99):
+            assert role_bullet_target(role, requested) <= role.bullet_budget
+        assert role_bullet_target(SceneRole.TITLE, 5) == 0
+
+    def test_a_deliberately_smaller_request_is_still_honoured(self):
+        """The budget is a ceiling, not a quota: asking for three points gets three."""
+        assert role_bullet_target(SceneRole.CONTENT, 3) == 3
+
+    # -------------------------------------------------------------------------- prompt
+
+    def test_the_prompt_names_every_scene_with_its_role_and_budgets(self, monkeypatch):
+        prompt = self._prompt(monkeypatch, 7)
+        for index, role in enumerate(role_plan(7), start=1):
+            low, target, high = narration_words(role)
+            bullets = role_bullet_target(role, BULLET_DEFAULT)
+            plural = "" if bullets == 1 else "s"
+            assert (
+                f"scene {index} — role: {role.value} — narration {target} words "
+                f"({low}-{high}) — {bullets} bullet{plural}"
+            ) in prompt
+
+    def test_the_prompt_forbids_bullets_on_the_title_card_in_words(self, monkeypatch):
+        prompt = self._prompt(monkeypatch, 5)
+        assert "ZERO bullets" in prompt
+        assert "scene 1 — role: title" in prompt
+        assert "0 bullets" in prompt
+
+    def test_a_video_without_a_recap_is_never_told_what_a_recap_is(self, monkeypatch):
+        """Describing the summary role in a five-slide prompt is an invitation to write
+        one, and the shape is then wrong however good the description was."""
+        prompt = self._prompt(monkeypatch, SUMMARY_FROM_SLIDES - 1)
+        assert "summary — the RECAP" not in prompt
+        assert "role: summary" not in prompt
+        assert "summary — the RECAP" in self._prompt(monkeypatch, SUMMARY_FROM_SLIDES)
+
+    def test_the_prompt_states_the_one_line_copy_caps(self, monkeypatch):
+        """DIRECTION §2.1/§2.2: a wrapped heading moves the first bullet's baseline, so the
+        stack starts at a different height on every slide."""
+        prompt = self._prompt(monkeypatch, 5)
+        assert f"at most {HEADING_CHAR_MAX} characters" in prompt
+        assert f"at most {BULLET_CHAR_MAX} characters" in prompt
+        assert f"at most {TITLE_CHAR_MAX} characters" in prompt
+        assert "Sentence case, NOT Title Case" in prompt
+
+    def test_the_prompt_asks_for_motion_in_clip_prompt_not_composition(self, monkeypatch):
+        prompt = self._prompt(monkeypatch, 5)
+        assert "clip_prompt" in prompt
+        assert "described as MOTION instead of composition" in prompt
+        assert "camera move" in prompt
+
+    # ------------------------------------------------------------------ returned script
+
+    def test_the_returned_script_carries_the_planned_shape(self, monkeypatch):
+        scenes = [_scene(i, narration=self.NARRATION) for i in range(1, 8)]
+        script = self._script(monkeypatch, scenes, 7)
+        assert [scene_role(s) for s in script.scenes] == role_plan(7)
+
+    def test_the_title_card_loses_bullets_the_model_sent_anyway(self, monkeypatch):
+        """The observed defect: scene 1 rendered as a title card carrying a content heading
+        and four bullets. DIRECTION §1.3 calls it the single worst defect in the output."""
+        scenes = [_scene(i, narration=self.NARRATION) for i in range(1, 6)]
+        for scene in scenes:
+            scene["bullets"] = ["Check The Sender Domain", "Hover Over Every Link"]
+        script = self._script(monkeypatch, scenes, 5)
+        assert scene_role(script.scenes[0]) is SceneRole.TITLE
+        assert script.scenes[0].bullets == []
+
+    def test_the_closing_is_cut_to_two_points_in_spoken_order(self, monkeypatch):
+        scenes = [_scene(i, narration=self.NARRATION) for i in range(1, 6)]
+        for scene in scenes:
+            scene["bullets"] = [
+                "Report Anything Suspicious",
+                "Check The Sender Domain",
+                "Hover Over Every Link",
+                "Urgent Deadlines",
+            ]
+        closing = self._script(monkeypatch, scenes, 5).scenes[-1]
+        assert scene_role(closing) is SceneRole.CLOSING
+        assert closing.bullets == ["Check The Sender Domain", "Hover Over Every Link"]
+
+    def test_a_model_that_labels_every_scene_content_is_overridden_by_position(
+        self, monkeypatch
+    ):
+        scenes = [_scene(i, narration=self.NARRATION) for i in range(1, 8)]
+        for scene in scenes:
+            scene["role"] = "content"
+        script = self._script(monkeypatch, scenes, 7)
+        assert [scene_role(s).value for s in script.scenes] == [
+            r.value for r in role_plan(7)
+        ]
+
+    def test_an_off_schema_role_does_not_crash_the_parse(self, monkeypatch):
+        scenes = [_scene(i, narration=self.NARRATION) for i in range(1, 5)]
+        scenes[0]["role"] = "interlude"
+        script = self._script(monkeypatch, scenes, 4)
+        assert scene_role(script.scenes[0]) is SceneRole.TITLE
+
+    def test_roles_are_assigned_after_a_scene_count_backfill(self, monkeypatch):
+        """`_fit_scene_count` can split one scene into several, so a scene's role depends on
+        where it ends up — not on what the model called it before the split."""
+        long_narration = " ".join([self.NARRATION] * 2)
+        script = self._script(monkeypatch, [_scene(1, narration=long_narration)], 4)
+        assert len(script.scenes) == 4
+        assert [scene_role(s) for s in script.scenes] == role_plan(4)
+        assert script.scenes[0].bullets == []
+
+    def test_clip_prompt_is_carried_through_and_missing_becomes_none(self, monkeypatch):
+        scenes = [_scene(i, narration=self.NARRATION) for i in range(1, 5)]
+        scenes[1]["clip_prompt"] = "Slow push in as a **cursor** hovers over the link"
+        script = self._script(monkeypatch, scenes, 4)
+        # Markdown is stripped: this text may be forwarded to a video model verbatim.
+        assert scene_clip_prompt(script.scenes[1]) == (
+            "Slow push in as a cursor hovers over the link"
+        )
+        assert scene_clip_prompt(script.scenes[0]) is None
+
+    def test_every_bullet_still_anchors_in_its_own_narration_at_every_role(
+        self, monkeypatch
+    ):
+        """The load-bearing invariant, unchanged by the new shape: an unanchored bullet
+        falls back to proportional placement and lands on the wrong words."""
+        scenes = [_scene(i, narration=self.NARRATION) for i in range(1, 8)]
+        for scene in scenes:
+            scene["bullets"] = ["Check The Sender Domain", "Hover Over Every Link"]
+        for scene in self._script(monkeypatch, scenes, 7).scenes:
+            for bullet in scene.bullets:
+                assert anchor_position(bullet, scene.narration) is not None, (
+                    scene.id,
+                    scene_role(scene).value,
+                    bullet,
+                )
+
+    # ------------------------------------------------------------- providers and helpers
+
+    def test_verbatim_scripts_are_all_content(self):
+        """It cannot resize a slice of the user's own words to fit a 4.5s title card, and
+        labelling a forty-word segment "title" would tell the renderer it is one."""
+        script = VerbatimScriptProvider(VERBATIM_TEXT).generate("bridges", 5)
+        assert [scene_role(s) for s in script.scenes] == [SceneRole.CONTENT] * 5
+
+    def test_verbatim_scenes_still_offer_a_motion_prompt(self):
+        for scene in VerbatimScriptProvider(VERBATIM_TEXT).generate("bridges", 3).scenes:
+            clip = scene_clip_prompt(scene)
+            assert clip and "push in" in clip
+            assert "No text, no letters" in clip
+
+    def test_the_role_helpers_default_for_a_plain_scene_script(self):
+        """A provider that knows nothing about roles still satisfies the Protocol, and the
+        pipeline reads its scenes through these two helpers."""
+        plain = SceneScript(id=1, narration="n", heading="H", image_prompt="p")
+        assert scene_role(plain) is SceneRole.CONTENT
+        assert scene_clip_prompt(plain) is None
+
+    def test_a_structured_scene_survives_pydantic_validation_inside_a_script(self):
+        """`Script.scenes` is typed `list[SceneScript]`; the subclass must not be coerced
+        away, or role and clip_prompt would silently vanish between provider and pipeline."""
+        script = VerbatimScriptProvider(VERBATIM_TEXT).generate("bridges", 2)
+        assert all(isinstance(s, StructuredSceneScript) for s in script.scenes)
 
 
 class TestSegmentSplitter:
@@ -1113,6 +1835,53 @@ class TestLiveSpeechAndAlignment:
         assert all(a.end <= b.start + 1e-6 for a, b in zip(aligned, aligned[1:], strict=False))
         assert aligned[-1].end <= duration + 0.05
         assert aligned[0].start >= 0.0
+
+
+@live_only
+class TestLiveBulletTiming:
+    """The whole chain: real script, real speech, real alignment, real reveal times."""
+
+    def test_generated_bullets_anchor_to_the_words_the_narrator_says(self, tmp_path):
+        script = GeminiScriptProvider().generate(
+            "How phishing attacks work and how to spot them", 4
+        )
+        assert len(script.scenes) == 4
+        for scene in script.scenes:
+            assert 3 <= len(scene.bullets) <= 5, scene.bullets
+            for bullet in scene.bullets:
+                assert not bullet.endswith(".")
+                assert bullet[0] not in "-*•"
+                assert anchor_position(bullet, scene.narration) is not None, (
+                    scene.id,
+                    bullet,
+                    scene.narration,
+                )
+
+        scene = script.scenes[0]
+        out = tmp_path / "scene1.wav"
+        path, duration = DeepgramSynthesizer().synthesize_with_duration(
+            scene.narration, "aura-2-draco-en", out
+        )
+        words = DeepgramAligner().align(path, scene.narration)
+        assert words
+
+        points = time_bullets(scene.bullets, words, 0.0, duration)
+        assert [p.text for p in points] == scene.bullets
+        times = [p.appear_at for p in points]
+        assert times == sorted(times), times
+        assert all(t >= 0.0 for t in times)
+        assert max(times) <= duration - TAIL_GUARD + 1e-6
+        assert sum(p.emphasis for p in points) == 1
+
+        # Every reveal must be a real anchor, not a proportional guess, and must sit next
+        # to the words it quotes rather than a second away from them.
+        anchors = find_anchors(scene.bullets, words, 0.0, duration)
+        for point, anchor in zip(points, anchors, strict=True):
+            assert anchor.method == "ngram", (anchor.text, anchor.method)
+            assert anchor.match_len >= 2 or len(anchor.text.split()) == 1
+            quoted = " ".join(anchor.matched_words).lower()
+            assert quoted in scene.narration.lower(), (quoted, scene.narration)
+            assert abs(point.appear_at - max(0.0, anchor.anchor_time - LEAD)) <= 1.0
 
 
 @live_only

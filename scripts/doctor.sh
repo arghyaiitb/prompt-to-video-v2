@@ -37,6 +37,28 @@ c=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Token $DG" https:/
 c=$(curl -s -o /dev/null -w '%{http_code}' "https://generativelanguage.googleapis.com/v1beta/models?key=$GK")
 [ "$c" = "200" ] && pass "gemini $c" || bad "gemini $c"
 
+echo "── gates ──"
+# Guard against a regression to `tsc --noEmit`, which passes vacuously here.
+if grep -q '"typecheck"' frontend/package.json 2>/dev/null; then
+  pass "frontend typecheck script present (tsc -b)"
+else
+  bad "frontend has no 'typecheck' script — 'tsc --noEmit' is vacuous with a solution tsconfig"
+fi
+
+echo "── artifacts ──"
+# VIDEO_OUTPUT_DIR is `./out`, which once resolved against the launch CWD and produced a
+# second tree under backend/. config.py anchors it to the repo root now; this catches a
+# regression, since a split tree silently hides finished videos from the API.
+if [ -d backend/out ]; then
+  bad "stray backend/out/ ($(du -sh backend/out | cut -f1)) — VIDEO_OUTPUT_DIR resolved against the wrong CWD"
+else
+  pass "single artifact tree (out/)"
+fi
+if [ -d out ]; then
+  empties=$(find out -mindepth 1 -maxdepth 1 -type d -empty 2>/dev/null | wc -l | tr -d ' ')
+  [ "$empties" = "0" ] && pass "no empty job dirs" || bad "$empties empty job dir(s) in out/ (failed jobs)"
+fi
+
 echo "── deps ──"
 [ -d backend/.venv ] && pass "backend venv" || bad "backend venv (run: cd backend && uv sync --extra dev)"
 [ -d frontend/node_modules ] && pass "frontend node_modules" || bad "frontend node_modules (run: cd frontend && pnpm install --force)"

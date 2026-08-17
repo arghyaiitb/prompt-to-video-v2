@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import jobs, voices
+from app.api import engines, jobs, themes, voices
 from app.core.config import get_settings
 from app.db.session import init_db
 
@@ -38,7 +38,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(engines.router)
 app.include_router(jobs.router)
+app.include_router(themes.router)
 app.include_router(voices.router)
 
 

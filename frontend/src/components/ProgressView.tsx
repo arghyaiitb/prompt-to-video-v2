@@ -1,9 +1,10 @@
 import { AlertTriangleIcon, Loader2Icon, RotateCcwIcon } from 'lucide-react'
 
+import { SceneInspector } from '@/components/SceneInspector'
 import { StageStepper } from '@/components/StageStepper'
 import { Button } from '@/components/ui/button'
 import { Progress } from '@/components/ui/progress'
-import { STAGE_LABELS, type Job } from '@/lib/types'
+import { STAGE_LABELS, type Job, type Timeline } from '@/lib/types'
 
 interface ProgressViewProps {
   job: Job
@@ -11,9 +12,25 @@ interface ProgressViewProps {
   pollError: string | null
   onRetryPoll: () => void
   onReset: () => void
+  /** Scene breakdown, polled alongside the status. */
+  timeline: Timeline | null
+  timelineLoading: boolean
+  timelinePending: boolean
+  timelineError: string | null
+  onRetryTimeline: () => void
 }
 
-export function ProgressView({ job, pollError, onRetryPoll, onReset }: ProgressViewProps) {
+export function ProgressView({
+  job,
+  pollError,
+  onRetryPoll,
+  onReset,
+  timeline,
+  timelineLoading,
+  timelinePending,
+  timelineError,
+  onRetryTimeline,
+}: ProgressViewProps) {
   const failed = job.status === 'failed'
   const stageLabel =
     job.current_stage !== null ? STAGE_LABELS[job.current_stage] : 'Waiting for the pipeline'
@@ -95,6 +112,16 @@ export function ProgressView({ job, pollError, onRetryPoll, onReset }: ProgressV
         <p className="mb-4 text-xs tracking-wide text-white/35 uppercase">Pipeline</p>
         <StageStepper status={job.status} currentStage={job.current_stage} />
       </div>
+
+      {/* Scene inspector — visibility into what is being built ------------ */}
+      <SceneInspector
+        timeline={timeline}
+        isLoading={timelineLoading}
+        isPending={timelinePending}
+        error={timelineError}
+        status={job.status}
+        onRetry={onRetryTimeline}
+      />
     </div>
   )
 }

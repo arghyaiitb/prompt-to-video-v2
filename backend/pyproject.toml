@@ -11,6 +11,7 @@ dependencies = [
     "sqlmodel>=0.0.22",
     "httpx>=0.27",
     "python-multipart>=0.0.12",
+    "boto3>=1.35",
 ]
 
 [project.optional-dependencies]
@@ -29,7 +30,8 @@ select = ["E", "F", "I", "UP", "B"]
 venvPath = "."
 venv = ".venv"
 extraPaths = ["."]
-pythonVersion = "3.12"
+# pythonVersion deliberately unset — pinning a version Pyright's bundled typeshed
+# doesn't know makes it fall back to an old stdlib and "forget" symbols like StrEnum.
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

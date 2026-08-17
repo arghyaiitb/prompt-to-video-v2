@@ -8,19 +8,71 @@ import { ProgressView } from '@/components/ProgressView'
 import { ResultView } from '@/components/ResultView'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Toaster } from '@/components/ui/sonner'
+import { useEngines } from '@/hooks/useEngines'
 import { useJobHistory } from '@/hooks/useJobHistory'
 import { useJobPolling } from '@/hooks/useJobPolling'
+import { useThemes } from '@/hooks/useThemes'
+import { useTimeline } from '@/hooks/useTimeline'
 import { useVoices } from '@/hooks/useVoices'
-import { createJob } from '@/lib/api'
-import type { CreateJobRequest } from '@/lib/types'
+import { createJob, ThemeContrastError, VoiceEngineMismatchError } from '@/lib/api'
+import { OPTIONAL_FIELD_LABELS, type CreateJobRequest, type ThemeContrastFailure } from '@/lib/types'
+
+/** `?job=<id>` opens straight into that job — handy for sharing a render. */
+function initialJobId(): string | null {
+  const value = new URLSearchParams(window.location.search).get('job')?.trim() ?? ''
+  return value === '' ? null : value
+}
 
 export default function App() {
-  const [activeJobId, setActiveJobId] = useState<string | null>(null)
+  const [activeJobId, setActiveJobId] = useState<string | null>(initialJobId)
   const [isSubmitting, setIsSubmitting] = useState(false)
+  /**
+   * The server's verdict on a custom palette. Held here rather than in the form
+   * because it arrives with the response to a submission, and it carries the
+   * corrected palette the "Fix contrast" button applies.
+   */
+  const [contrastFailure, setContrastFailure] = useState<ThemeContrastFailure | null>(null)
 
-  const { voices, isLoading: voicesLoading, usedFallback } = useVoices()
+  // The engine drives the voice request, so it is resolved before `useVoices`.
+  const {
+    engines,
+    isLoading: enginesLoading,
+    usedFallback: usedFallbackEngines,
+    selectedId: engineId,
+    select: selectEngine,
+  } = useEngines()
+  const {
+    voices,
+    isLoading: voicesLoading,
+    usedFallback,
+    engineMismatch: voicesEngineMismatch,
+  } = useVoices(engineId)
+  const {
+    themes,
+    isLoading: themesLoading,
+    usedFallback: usedFallbackThemes,
+  } = useThemes()
   const { job, isLoading: jobLoading, error: pollError, refresh } = useJobPolling(activeJobId)
   const { jobs, isLoading: historyLoading, error: historyError, reload } = useJobHistory()
+
+  // Polled alongside the status: the scene breakdown is the useful thing to
+  // watch while a render grinds through eight stages.
+  const {
+    timeline,
+    isLoading: timelineLoading,
+    isPending: timelinePending,
+    error: timelineError,
+    refresh: refreshTimeline,
+  } = useTimeline(activeJobId, job?.status ?? null)
+
+  // Mirror the selection into the URL (replace, not push: the back button
+  // should leave the app rather than walk a trail of job ids).
+  useEffect(() => {
+    const url = new URL(window.location.href)
+    if (activeJobId === null) url.searchParams.delete('job')
+    else url.searchParams.set('job', activeJobId)
+    window.history.replaceState(null, '', url)
+  }, [activeJobId])
 
   // Keep the history list honest as the active job moves through the pipeline.
   useEffect(() => {
@@ -30,12 +82,52 @@ export default function App() {
   const handleSubmit = useCallback(
     (request: CreateJobRequest) => {
       setIsSubmitting(true)
+      setContrastFailure(null)
       void createJob(request)
         .then((response) => {
           setActiveJobId(response.job_id)
           reload()
+
+          // The backend accepted the job only after we dropped the newer
+          // fields — say so rather than silently ignoring the settings.
+          // Accepted, but the palette sits between AA and our recommendation.
+          if (response.themeWarnings.length > 0) {
+            toast.warning('Palette accepted with a caveat', {
+              description: response.themeWarnings.join(' '),
+            })
+          }
+
+          if (response.droppedFields.length > 0) {
+            const names = response.droppedFields.map(
+              (field) => OPTIONAL_FIELD_LABELS[field as keyof typeof OPTIONAL_FIELD_LABELS] ?? field,
+            )
+            toast.warning('Some settings were ignored', {
+              description: `This backend does not accept ${names.join(', ')} yet. The video is being made with the remaining settings.`,
+            })
+          }
         })
         .catch((cause: unknown) => {
+          // The contrast gate is not a generic failure: it comes back with the
+          // failing pairs and a corrected palette, so it belongs in the form
+          // next to the colours rather than in a toast that scrolls away.
+          if (cause instanceof ThemeContrastError) {
+            setContrastFailure(cause.failure)
+            toast.error('That palette is not readable on screen', {
+              description:
+                cause.failure.failures[0] ??
+                'Use "Fix contrast" to apply the nearest palette that passes.',
+            })
+            return
+          }
+          // The voice/engine pair is derived, so this should be unreachable —
+          // it means the UI and server disagree about which engine owns a
+          // voice. Named explicitly so that shows up as a bug, not as noise.
+          if (cause instanceof VoiceEngineMismatchError) {
+            toast.error('That voice does not belong to the selected engine', {
+              description: cause.mismatch.message,
+            })
+            return
+          }
           toast.error('Could not start the video', {
             description: cause instanceof Error ? cause.message : 'Unknown error.',
           })
@@ -46,6 +138,10 @@ export default function App() {
     },
     [reload],
   )
+
+  const dismissContrastFailure = useCallback(() => {
+    setContrastFailure(null)
+  }, [])
 
   const handleReset = useCallback(() => {
     setActiveJobId(null)
@@ -87,9 +183,20 @@ export default function App() {
             <div className="rounded-2xl border border-white/[0.08] bg-white/[0.02] p-6 shadow-2xl shadow-black/40 backdrop-blur-sm sm:p-8">
               {activeJobId === null ? (
                 <CreateForm
+                  engines={engines}
+                  enginesLoading={enginesLoading}
+                  usedFallbackEngines={usedFallbackEngines}
+                  engineId={engineId}
+                  onSelectEngine={selectEngine}
                   voices={voices}
                   voicesLoading={voicesLoading}
                   usedFallbackVoices={usedFallback}
+                  voicesEngineMismatch={voicesEngineMismatch}
+                  themes={themes}
+                  themesLoading={themesLoading}
+                  usedFallbackThemes={usedFallbackThemes}
+                  contrastFailure={contrastFailure}
+                  onDismissContrastFailure={dismissContrastFailure}
                   isSubmitting={isSubmitting}
                   onSubmit={handleSubmit}
                 />
@@ -119,13 +226,28 @@ export default function App() {
                   </div>
                 )
               ) : job.status === 'done' ? (
-                <ResultView job={job} onReset={handleReset} />
+                <ResultView
+                  job={job}
+                  themes={themes}
+                  engines={engines}
+                  timeline={timeline}
+                  timelineLoading={timelineLoading}
+                  timelinePending={timelinePending}
+                  timelineError={timelineError}
+                  onRetryTimeline={refreshTimeline}
+                  onReset={handleReset}
+                />
               ) : (
                 <ProgressView
                   job={job}
                   pollError={pollError}
                   onRetryPoll={refresh}
                   onReset={handleReset}
+                  timeline={timeline}
+                  timelineLoading={timelineLoading}
+                  timelinePending={timelinePending}
+                  timelineError={timelineError}
+                  onRetryTimeline={refreshTimeline}
                 />
               )}
             </div>
@@ -135,6 +257,8 @@ export default function App() {
           <aside className="lg:sticky lg:top-16 lg:self-start">
             <JobHistory
               jobs={jobs}
+              themes={themes}
+              engines={engines}
               isLoading={historyLoading}
               error={historyError}
               activeJobId={activeJobId}

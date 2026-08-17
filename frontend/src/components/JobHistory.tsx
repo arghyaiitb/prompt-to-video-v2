@@ -6,14 +6,25 @@ import {
   RefreshCwIcon,
 } from 'lucide-react'
 
+import { EngineBadge } from '@/components/EngineBadge'
+import { ThemeBadge } from '@/components/ThemeBadge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
-import { formatRelativeTime } from '@/lib/format'
+import { useNow } from '@/hooks/useNow'
+import { formatAbsoluteTime, formatRelativeTime } from '@/lib/format'
 import { cn } from '@/lib/utils'
-import { STAGE_LABELS, type Job, type JobStatus } from '@/lib/types'
+import {
+  STAGE_LABELS,
+  type Job,
+  type JobStatus,
+  type SpeechEngine,
+  type ThemePreset,
+} from '@/lib/types'
 
 interface JobHistoryProps {
   jobs: Job[]
+  themes: ThemePreset[]
+  engines: SpeechEngine[]
   isLoading: boolean
   error: string | null
   activeJobId: string | null
@@ -39,12 +50,17 @@ function statusChip(status: JobStatus): { label: string; className: string } {
 
 export function JobHistory({
   jobs,
+  themes,
+  engines,
   isLoading,
   error,
   activeJobId,
   onSelect,
   onReload,
 }: JobHistoryProps) {
+  // Ticking clock so "3 min ago" ages without a refresh.
+  const now = useNow(15_000)
+
   return (
     <section className="space-y-3">
       <div className="flex items-center justify-between">
@@ -134,11 +150,14 @@ export function JobHistory({
                       >
                         {chip.label}
                       </span>
-                      {/* The backend's JobStatusOut carries no timestamp, so
-                          this only renders if one is ever added. */}
+                      {/* `created_at` is UTC without a `Z`; `formatRelativeTime`
+                          normalises it before comparing against `now`. */}
                       {job.created_at !== null && (
-                        <span className="text-[10px] text-white/30">
-                          {formatRelativeTime(job.created_at)}
+                        <span
+                          className="text-[10px] text-white/30"
+                          title={formatAbsoluteTime(job.created_at) ?? undefined}
+                        >
+                          {formatRelativeTime(job.created_at, now)}
                         </span>
                       )}
                       {job.status !== 'done' && job.status !== 'failed' && (
@@ -146,6 +165,8 @@ export function JobHistory({
                           {job.progress}%
                         </span>
                       )}
+                      <ThemeBadge job={job} themes={themes} small />
+                      <EngineBadge job={job} engines={engines} small />
                     </div>
                   </div>
                 </div>

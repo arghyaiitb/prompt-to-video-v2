@@ -8,15 +8,20 @@ skipped when no usable ffmpeg is on the box.
 from __future__ import annotations
 
 import math
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from app.core.models import (
+    BulletPoint,
     Motion,
     RenderProfile,
     Scene,
+    SlideLayout,
+    TextAnimation,
     TextPosition,
+    Theme,
     Timeline,
     Transition,
     VisualPlan,
@@ -24,9 +29,21 @@ from app.core.models import (
 )
 from app.render import captions, text_overlay
 from app.render import ffmpeg as ff
-from app.render.ffmpeg_backend import FFmpegBackend, frames_for
+from app.render.contracts import SceneText, TextLayer
+from app.render.ffmpeg_backend import (
+    AUTO_LOGO,
+    FFmpegBackend,
+    fallback_region,
+    ffmpeg_colour,
+    frames_for,
+    layout_region,
+    resolve_logo_source,
+)
 from app.render.planner import (
+    BULLET_ANIMATION_ROTATION,
+    HEADING_ANIMATION_ROTATION,
     MAX_ZOOM_SPAN,
+    MIN_ANIM_DURATION,
     MIN_ZOOM_SPAN,
     MOTION_ROTATION,
     RuleBasedPlanner,
@@ -36,7 +53,11 @@ HD = RenderProfile()
 integration = pytest.mark.skipif(not ff.available(), reason="no usable ffmpeg")
 
 
-def make_timeline(durations: list[float], motions: list[Motion] | None = None) -> Timeline:
+def make_timeline(
+    durations: list[float],
+    motions: list[Motion] | None = None,
+    bullets: list[list[BulletPoint]] | None = None,
+) -> Timeline:
     scenes: list[Scene] = []
     cursor = 0.0
     for index, duration in enumerate(durations):
@@ -50,6 +71,7 @@ def make_timeline(durations: list[float], motions: list[Motion] | None = None) -
                 start=cursor,
                 end=cursor + duration,
                 plan=plan,
+                bullets=bullets[index] if bullets else [],
             )
         )
         cursor += duration
@@ -142,14 +164,28 @@ def test_first_scene_fades_up_from_black_then_transitions_alternate():
     transitions = [scene.plan.transition_in for scene in timeline.scenes]
     assert transitions[0] is Transition.FADE
     assert transitions[1:] == [
-        Transition.DISSOLVE,
+        Transition.FADE,
         Transition.SLIDE_LEFT,
         Transition.WIPE_RIGHT,
-        Transition.DISSOLVE,
+        Transition.FADE,
         Transition.SLIDE_LEFT,
         Transition.WIPE_RIGHT,
     ]
     assert all(a != b for a, b in zip(transitions[1:], transitions[2:], strict=False))
+
+
+def test_dissolve_is_never_chosen_because_this_build_dithers_it():
+    """Measured defect: xfade=dissolve on this ffmpeg is a noise dissolve, not a blend.
+
+    Mid-transition frames come out visibly grainy. FADE is the smooth crossfade, so
+    the rotation uses that instead. The enum member stays for deserialising old plans.
+    """
+    timeline = RuleBasedPlanner().plan(make_timeline([4.0] * 12))
+    chosen = {scene.plan.transition_in for scene in timeline.scenes}
+    assert Transition.DISSOLVE not in chosen, chosen
+    assert Transition.FADE in chosen, "the smooth crossfade must still be in rotation"
+    assert {Transition.SLIDE_LEFT, Transition.WIPE_RIGHT} <= chosen, "keep the variants"
+    assert hasattr(Transition, "DISSOLVE"), "the enum member must survive for old plans"
 
 
 def test_transition_duration_clamped_to_40_percent_of_shorter_neighbour():
@@ -178,12 +214,151 @@ def test_unusably_short_transition_is_demoted_to_a_cut():
     assert timeline.scenes[1].plan.transition_duration == 0.0
 
 
-def test_text_position_alternates_so_slides_do_not_stack_text():
+def test_text_position_follows_the_slide_layout_by_default():
+    """The training layout puts text in a panel beside the image, not over it."""
     timeline = RuleBasedPlanner().plan(make_timeline([4.0] * 6))
+    by_layout = {
+        scene.plan.layout: scene.plan.text_position for scene in timeline.scenes
+    }
+    assert by_layout[SlideLayout.TITLE_CARD] is TextPosition.CENTER
+    assert by_layout[SlideLayout.HERO_RIGHT] is TextPosition.LEFT_PANEL
+    assert by_layout[SlideLayout.HERO_LEFT] is TextPosition.LEFT_PANEL
+    assert all(scene.plan.scrim_opacity == pytest.approx(0.45) for scene in timeline.scenes)
+
+
+def test_alternating_text_position_is_still_available_for_photo_decks():
+    timeline = RuleBasedPlanner(alternate_text_position=True).plan(make_timeline([4.0] * 6))
     positions = [scene.plan.text_position for scene in timeline.scenes]
     assert positions[0] is TextPosition.LOWER_THIRD
     assert all(a != b for a, b in zip(positions, positions[1:], strict=False))
-    assert all(scene.plan.scrim_opacity == pytest.approx(0.45) for scene in timeline.scenes)
+
+
+def test_an_explicit_text_position_pins_every_scene():
+    timeline = RuleBasedPlanner(text_position=TextPosition.LOWER_THIRD).plan(
+        make_timeline([4.0] * 4)
+    )
+    assert all(s.plan.text_position is TextPosition.LOWER_THIRD for s in timeline.scenes)
+
+
+# ============================================================= planner: layouts
+
+
+def test_opener_is_a_title_card_and_the_body_alternates_hero_sides():
+    timeline = RuleBasedPlanner().plan(make_timeline([4.0] * 6))
+    layouts = [scene.plan.layout for scene in timeline.scenes]
+    assert layouts[0] is SlideLayout.TITLE_CARD, "open on type, not a photo"
+    assert layouts[1] is SlideLayout.HERO_RIGHT
+    assert layouts[2] is SlideLayout.HERO_LEFT, "flip the hero side so the eye moves"
+
+
+def test_full_bleed_photography_is_used_at_most_once():
+    for count in range(1, 13):
+        timeline = RuleBasedPlanner().plan(make_timeline([4.0] * count))
+        layouts = [scene.plan.layout for scene in timeline.scenes]
+        assert layouts.count(SlideLayout.FULL_BLEED) <= 1, layouts
+
+
+def test_no_layout_repeats_three_scenes_running():
+    for count in range(3, 15):
+        layouts = [
+            scene.plan.layout
+            for scene in RuleBasedPlanner().plan(make_timeline([4.0] * count)).scenes
+        ]
+        triples = zip(layouts, layouts[1:], layouts[2:], strict=False)
+        assert all(not (a == b == c) for a, b, c in triples), layouts
+
+
+def test_title_card_opener_can_be_turned_off():
+    timeline = RuleBasedPlanner(title_card_opener=False).plan(make_timeline([4.0] * 3))
+    assert timeline.scenes[0].plan.layout is not SlideLayout.TITLE_CARD
+
+
+# ========================================================== planner: animation
+
+
+def test_heading_animation_varies_between_consecutive_scenes():
+    timeline = RuleBasedPlanner().plan(make_timeline([4.0] * 9))
+    headings = [scene.plan.heading_animation for scene in timeline.scenes]
+    assert all(a != b for a, b in zip(headings, headings[1:], strict=False)), headings
+    assert len(set(headings)) >= 3, f"a deck of nine slides needs variety: {headings}"
+    assert all(a in HEADING_ANIMATION_ROTATION for a in headings)
+
+
+def test_bullet_animation_varies_between_scenes_but_never_within_one():
+    """A stack of bullets entering from four directions reads as chaos.
+
+    There is exactly one ``bullet_animation`` per plan by construction: variety inside
+    a scene is expressed as staggered *timing*, not as different directions.
+    """
+    timeline = RuleBasedPlanner().plan(make_timeline([4.0] * 9))
+    bullets = [scene.plan.bullet_animation for scene in timeline.scenes]
+
+    assert all(a != b for a, b in zip(bullets, bullets[1:], strict=False)), bullets
+    assert all(a in BULLET_ANIMATION_ROTATION for a in bullets)
+    for scene in timeline.scenes:
+        assert isinstance(scene.plan.bullet_animation, TextAnimation)
+
+
+def test_heading_and_bullets_never_share_an_animation_in_one_scene():
+    """Otherwise the title and every bullet slide in as one slab."""
+    timeline = RuleBasedPlanner().plan(make_timeline([4.0] * 12))
+    for scene in timeline.scenes:
+        assert scene.plan.heading_animation is not scene.plan.bullet_animation, scene.plan
+
+
+def test_typewriter_is_never_chosen_by_default():
+    """The renderer can only approximate it as a wipe, so it stays opt-in."""
+    timeline = RuleBasedPlanner().plan(make_timeline([4.0] * 12))
+    chosen = {s.plan.heading_animation for s in timeline.scenes} | {
+        s.plan.bullet_animation for s in timeline.scenes
+    }
+    assert TextAnimation.TYPEWRITER not in chosen
+
+
+def test_anim_duration_never_exceeds_the_gap_to_the_next_bullet():
+    """Overlapping entrances read as a smear rather than a sequence."""
+    bullets = [
+        [
+            BulletPoint(text="a", appear_at=0.5),
+            BulletPoint(text="b", appear_at=0.8),  # a 0.3s gap
+            BulletPoint(text="c", appear_at=2.0),
+        ]
+    ]
+    timeline = RuleBasedPlanner().plan(make_timeline([8.0], bullets=bullets))
+    anim = timeline.scenes[0].plan.anim_duration
+    assert anim <= 0.3 + 1e-9, anim
+    assert anim < 0.45, "the default must have been clamped down"
+    assert anim >= MIN_ANIM_DURATION
+
+
+def test_anim_duration_finishes_well_before_the_scene_ends():
+    bullets = [[BulletPoint(text="last", appear_at=1.7)]]
+    timeline = RuleBasedPlanner().plan(make_timeline([2.0], bullets=bullets))
+    plan = timeline.scenes[0].plan
+    # 1.7s reveal in a 2.0s scene leaves no room, so the floor applies -- and the
+    # floor is small enough that the entrance is over before the crossfade starts.
+    assert plan.anim_duration == pytest.approx(MIN_ANIM_DURATION)
+    assert 1.7 + plan.anim_duration < 2.0
+
+
+def test_anim_duration_is_clamped_to_a_fraction_of_a_short_scene():
+    timeline = RuleBasedPlanner().plan(make_timeline([1.2]))
+    anim = timeline.scenes[0].plan.anim_duration
+    assert anim <= 1.2 * 0.18 + 1e-9, anim
+    assert anim >= MIN_ANIM_DURATION
+
+
+def test_anim_duration_keeps_the_default_when_there_is_room():
+    timeline = RuleBasedPlanner().plan(
+        make_timeline([8.0], bullets=[[BulletPoint(text="x", appear_at=2.0)]])
+    )
+    assert timeline.scenes[0].plan.anim_duration == pytest.approx(0.45)
+
+
+def test_anim_duration_never_goes_negative_for_absurd_input():
+    bullets = [[BulletPoint(text="late", appear_at=99.0)]]
+    timeline = RuleBasedPlanner().plan(make_timeline([0.1], bullets=bullets))
+    assert timeline.scenes[0].plan.anim_duration == pytest.approx(MIN_ANIM_DURATION)
 
 
 # ========================================================= duration arithmetic
@@ -239,6 +414,156 @@ def test_video_chain_handles_a_cut_without_consuming_time():
     assert "concat=n=2:v=1:a=0" in graph
     assert starts[1] == pytest.approx(5.0), "a cut starts exactly where the last clip ends"
     assert length == pytest.approx(timeline.final_duration())
+
+
+# ================================================================== watermark
+
+
+LOGO_SVG = Path("/Users/argo/ab/prompt-to-video-v2/frontend/public/favicon.svg")
+needs_magick = pytest.mark.skipif(
+    text_overlay.imagemagick_bin() is None, reason="ImageMagick not installed"
+)
+
+
+def test_resolve_logo_source_auto_falls_back_to_the_apps_own_mark():
+    resolved = resolve_logo_source(AUTO_LOGO)
+    if LOGO_SVG.is_file():
+        assert resolved == LOGO_SVG
+    else:
+        assert resolved is None
+
+
+@pytest.mark.parametrize("disabled", [None, "", ".", "none", Path("")])
+def test_an_empty_or_absent_logo_setting_disables_branding_silently(disabled):
+    """`VIDEO_LOGO_PATH=` in .env arrives as Path('.'), which is a directory, not a mark."""
+    assert resolve_logo_source(disabled) is None
+
+
+def test_a_configured_logo_that_does_not_exist_is_skipped_not_raised(tmp_path):
+    """Branding must never be able to fail a render."""
+    assert resolve_logo_source(tmp_path / "missing.svg") is None
+    real = tmp_path / "here.png"
+    real.write_bytes(b"x")
+    assert resolve_logo_source(real) == real
+
+
+def test_a_backend_with_branding_off_asks_for_no_logo():
+    assert FFmpegBackend(text_mode="scrim", logo_path=None).logo_source is None
+    assert FFmpegBackend(text_mode="scrim", logo_path=None).logo_png(HD, Path("/tmp")) is None
+
+
+def test_the_logo_offsets_are_even_because_yuv420p_subsamples_chroma():
+    """An odd overlay offset lands the layer on a half-pixel of the chroma plane."""
+    backend = FFmpegBackend(text_mode="scrim")
+    for profile in (HD, RenderProfile(width=1280, height=717), RenderProfile.draft()):
+        region = backend.logo_region(profile)
+        assert region.x % 2 == 0 and region.y % 2 == 0
+        assert region.x >= 0 and region.y >= 0
+        assert region.y + region.height <= profile.height + region.height
+
+
+def test_the_logo_is_the_last_stage_of_the_video_chain():
+    """After the fades, not before them.
+
+    Before the fades the mark would dim with the opening fade-up and the closing
+    fade-out, and 'constant for the entire video' is the requirement.
+    """
+    timeline = RuleBasedPlanner().plan(make_timeline([4.0, 3.0, 5.0]))
+    backend = FFmpegBackend(text_mode="scrim")
+    durations = [scene.duration for scene in timeline.scenes]
+    box = backend.logo_region(HD)
+
+    parts, _, length = backend._video_chain(timeline, durations, logo_input=9, logo_box=box)
+    graph = ";".join(parts)
+
+    assert f"[faded][logo]overlay=x={box.x}:y={box.y}" in graph
+    assert graph.endswith("[vout]")
+    overlay_stage = parts[-1]
+    assert "overlay=" in overlay_stage and overlay_stage.endswith("format=yuv420p[vout]")
+    # The fades are upstream of the overlay, so they cannot touch it.
+    faded = next(p for p in parts if p.endswith("[faded]"))
+    assert "fade=t=in" in faded and "fade=t=out" in faded
+    assert "fade=" not in overlay_stage
+    # And the mark itself gets no fade, no trim, nothing time-varying.
+    logo_prep = next(p for p in parts if p.startswith("[9:v]"))
+    assert logo_prep == "[9:v]format=rgba,setsar=1[logo]"
+    assert length == pytest.approx(timeline.final_duration())
+
+
+def test_the_logo_overlay_does_not_change_the_chain_length():
+    """`assemble` asserts against final_duration(); branding must be duration-neutral."""
+    timeline = RuleBasedPlanner().plan(make_timeline([4.0, 3.0, 5.0, 2.0]))
+    backend = FFmpegBackend(text_mode="scrim")
+    durations = [scene.duration for scene in timeline.scenes]
+
+    plain_parts, plain_starts, plain_len = backend._video_chain(timeline, durations)
+    box = backend.logo_region(HD)
+    logo_parts, logo_starts, logo_len = backend._video_chain(
+        timeline, durations, logo_input=4, logo_box=box
+    )
+
+    assert logo_len == pytest.approx(plain_len)
+    assert logo_starts == plain_starts
+    # Same xfade stages, plus exactly two more filters (the prep and the overlay).
+    assert len(logo_parts) == len(plain_parts) + 2
+    for filt in ("xfade", "offset="):
+        assert ";".join(plain_parts).count(filt) == ";".join(logo_parts).count(filt)
+
+
+def test_the_logo_chain_is_valid_even_with_no_fades_and_no_captions():
+    """A filterchain cannot be empty; with a single cut scene the tail would be."""
+    timeline = make_timeline([3.0])
+    timeline.scenes[0].plan = VisualPlan(
+        transition_in=Transition.CUT, transition_duration=0.0
+    )
+    backend = FFmpegBackend(text_mode="scrim", final_fade_out=False)
+    box = backend.logo_region(HD)
+
+    parts, _, _ = backend._video_chain(timeline, [3.0], logo_input=1, logo_box=box)
+    faded = next(p for p in parts if p.endswith("[faded]"))
+    assert faded == "[c0]null[faded]", faded
+
+
+def test_no_layout_the_planner_produces_collides_with_the_logo():
+    """The corner is reserved by geometry, so this should hold without intervention."""
+    timeline = RuleBasedPlanner().plan(
+        make_timeline([6.0] * 5, bullets=[[BulletPoint(text="A point", appear_at=0.5)]] * 5)
+    )
+    backend = FFmpegBackend(text_mode="scrim")
+    assert backend.logo_conflicts(timeline, backend.logo_region(HD)) == []
+
+
+def test_a_collision_is_reported_rather_than_silently_overlapped():
+    """Move the logo on top of the text and the check must say so, per scene.
+
+    Reported, not resolved: nudging the mark per scene would make it move, which is
+    exactly what a persistent brand mark must not do.
+    """
+    timeline = RuleBasedPlanner().plan(
+        make_timeline([6.0, 6.0], bullets=[[BulletPoint(text="A point", appear_at=0.5)]] * 2)
+    )
+    backend = FFmpegBackend(text_mode="scrim")
+    # A logo occupying most of the frame overlaps every slide's text by construction.
+    huge = FFmpegBackend(text_mode="scrim").logo_region(HD)
+    huge = type(huge)(0, 0, HD.width, HD.height)
+
+    conflicts = backend.logo_conflicts(timeline, huge)
+    assert len(conflicts) == len(timeline.scenes)
+    for scene, message in zip(timeline.scenes, conflicts, strict=True):
+        assert f"scene {scene.id}" in message
+        assert scene.plan.layout.value in message
+        assert "overlaps the logo" in message
+
+
+@needs_magick
+def test_the_logo_png_is_cached_in_the_job_directory(tmp_path):
+    backend = FFmpegBackend(text_mode="scrim")
+    if backend.logo_source is None:
+        pytest.skip("no logo source available")
+    png = backend.logo_png(HD, tmp_path)
+    assert png is not None
+    assert tmp_path in png.parents, "the rasterised mark must live under the job dir"
+    assert backend.logo_png(HD, tmp_path) == png
 
 
 def test_frames_for_is_frame_exact():
@@ -308,36 +633,475 @@ def test_single_frame_clip_does_not_divide_by_zero():
     assert _evaluate(z, on=0) == pytest.approx(plan.zoom_from)
 
 
+def _graph(backend: FFmpegBackend, plan: VisualPlan, profile: RenderProfile, **kwargs) -> str:
+    """Build a scene graph, defaulting the boilerplate the tests do not care about."""
+    return backend._scene_graph(
+        src_size=kwargs.pop("src_size", (1920, 1080)),
+        plan=plan,
+        profile=profile,
+        frames=kwargs.pop("frames", 90),
+        text_layout=text_overlay.layout_heading(kwargs.get("heading", "Hi"), plan, profile),
+        heading=kwargs.pop("heading", "Hi"),
+        has_image_input=kwargs.pop(
+            "has_image_input", layout_region(plan, profile) is not None
+        ),
+        **kwargs,
+    )
+
+
 def test_scene_graph_upscales_before_zoompan_to_kill_the_stepping():
     profile = RenderProfile(width=1920, height=1080, upscale_factor=4)
-    backend = FFmpegBackend(text_mode="scrim")
-    graph = backend._scene_graph(
-        src_size=(1920, 1080),
-        plan=VisualPlan(motion=Motion.PAN_RIGHT, zoom_from=1.1, zoom_to=1.1),
-        profile=profile,
-        frames=90,
-        layout=text_overlay.layout_heading("Hi", VisualPlan(), profile),
-        heading="Hi",
-        has_text_input=False,
+    plan = VisualPlan(
+        layout=SlideLayout.FULL_BLEED, motion=Motion.PAN_RIGHT, zoom_from=1.1, zoom_to=1.1
     )
+    graph = _graph(FFmpegBackend(text_mode="scrim"), plan, profile)
+
     assert "scale=7680:4320" in graph, "source must be pre-upscaled by upscale_factor"
     assert "s=1920x1080" in graph, "zoompan must emit the final size"
     assert graph.index("scale=7680:4320") < graph.index("zoompan")
 
 
+def test_ken_burns_happens_inside_the_image_region_not_across_the_frame():
+    """The whole correctness point of the designed-frame layout.
+
+    zoompan must emit the *region's* size, and the upscale headroom is relative to the
+    region too -- otherwise the pan travels across the frame and the panel edge moves.
+    """
+    profile = RenderProfile(width=1920, height=1080, upscale_factor=4)
+    plan = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.ZOOM_IN)
+    region = layout_region(plan, profile)
+    graph = _graph(FFmpegBackend(text_mode="scrim"), plan, profile, src_size=(2752, 1536))
+
+    assert region is not None and region.width < profile.width
+    zoompan = next(part for part in graph.split(";") if "zoompan" in part)
+    assert f"s={region.width}x{region.height}" in zoompan, "zoompan must emit region size"
+    assert "s=1920x1080" not in zoompan, "a hero panel is not the frame"
+    assert f"scale={region.width * 4}:{region.height * 4}" in graph
+    assert f"overlay=x={region.x}:y={region.y}" in graph, "region must land at its offset"
+    assert graph.startswith("color=c=0x0B1220:s=1920x1080"), "solid background first"
+
+
 def test_static_motion_skips_zoompan_entirely():
     profile = RenderProfile(width=640, height=360, upscale_factor=4)
-    graph = FFmpegBackend(text_mode="scrim")._scene_graph(
-        src_size=(640, 360),
-        plan=VisualPlan(motion=Motion.STATIC),
-        profile=profile,
-        frames=30,
-        layout=text_overlay.layout_heading("Hi", VisualPlan(), profile),
-        heading="Hi",
-        has_text_input=False,
-    )
+    plan = VisualPlan(layout=SlideLayout.FULL_BLEED, motion=Motion.STATIC)
+    graph = _graph(FFmpegBackend(text_mode="scrim"), plan, profile, src_size=(640, 360))
     assert "zoompan" not in graph
     assert "scale=640:360" in graph
+
+
+# ============================================================== slide geometry
+
+
+def test_every_layout_but_the_title_card_has_an_image_region_inside_the_frame():
+    for layout in SlideLayout:
+        plan = VisualPlan(layout=layout)
+        region = layout_region(plan, HD)
+        if layout is SlideLayout.TITLE_CARD:
+            assert region is None, "a title card is type on colour; it has no image"
+            continue
+        assert region is not None
+        assert region.x >= 0 and region.y >= 0
+        assert region.x + region.width <= HD.width
+        assert region.y + region.height <= HD.height
+
+
+def test_region_edges_are_even_because_yuv420p_subsamples_chroma():
+    for layout in SlideLayout:
+        region = layout_region(VisualPlan(layout=layout), HD)
+        if region is None:
+            continue
+        assert region.x % 2 == 0 and region.y % 2 == 0, region
+        assert region.width % 2 == 0 and region.height % 2 == 0, region
+
+
+def test_hero_image_occupies_roughly_half_the_width_leaving_a_text_column():
+    for layout in (SlideLayout.HERO_LEFT, SlideLayout.HERO_RIGHT):
+        region = layout_region(VisualPlan(layout=layout), HD)
+        share = region.width / HD.width
+        assert 0.40 <= share <= 0.50, f"{layout}: {share:.3f}"
+        assert region.width < HD.width - region.width, "text needs the larger share"
+
+
+def test_hero_left_and_hero_right_are_mirrors():
+    left = layout_region(VisualPlan(layout=SlideLayout.HERO_LEFT), HD)
+    right = layout_region(VisualPlan(layout=SlideLayout.HERO_RIGHT), HD)
+    assert (left.width, left.height) == (right.width, right.height)
+    assert left.x < right.x
+    assert HD.width - (right.x + right.width) == pytest.approx(left.x, abs=2)
+
+
+def test_full_bleed_fills_the_frame():
+    region = layout_region(VisualPlan(layout=SlideLayout.FULL_BLEED), HD)
+    assert (region.x, region.y) == (0, 0)
+    assert (region.width, region.height) == (HD.width, HD.height)
+
+
+def test_regions_scale_with_the_profile_rather_than_being_hardcoded():
+    small = RenderProfile(width=960, height=540)
+    plan = VisualPlan(layout=SlideLayout.HERO_RIGHT)
+    big, tiny = layout_region(plan, HD), layout_region(plan, small)
+    assert tiny.width / small.width == pytest.approx(big.width / HD.width, abs=0.02)
+
+
+def test_fallback_region_matches_the_shape_of_the_real_one():
+    """Used only when text_overlay cannot supply geometry; must not be absurd."""
+    for layout in SlideLayout:
+        fallback = fallback_region(layout, HD)
+        real = layout_region(VisualPlan(layout=layout), HD)
+        assert (fallback is None) == (real is None), layout
+        if fallback is None:
+            continue
+        assert fallback.x + fallback.width <= HD.width
+        assert fallback.y + fallback.height <= HD.height
+
+
+def test_title_card_graph_needs_no_image_input_at_all():
+    """render_all must not demand an image_path for a slide that has no image."""
+    plan = VisualPlan(layout=SlideLayout.TITLE_CARD)
+    graph = _graph(FFmpegBackend(text_mode="scrim"), plan, HD)
+    assert "[0:v]" not in graph, "nothing may reference an image input"
+    assert "zoompan" not in graph
+    assert graph.startswith("color=c=0x0B1220")
+
+
+def test_bounded_panels_cover_crop_while_full_bleed_may_blur_fill():
+    """A blurred letterbox inside a panel is mush; the design wants a clean edge."""
+    cropped = ";".join(
+        FFmpegBackend._fit_chain((1080, 1920), (856, 816), (856, 816), blur_fill=False)
+    )
+    assert "gblur" not in cropped
+    assert "force_original_aspect_ratio=increase" in cropped
+    filled = ";".join(FFmpegBackend._fit_chain((1080, 1920), (1920, 1080), (1920, 1080)))
+    assert "gblur" in filled
+
+
+def test_fit_chain_labels_do_not_collide_with_the_slide_background():
+    """Duplicate filtergraph labels are a parse error, not a warning."""
+    chain = ";".join(FFmpegBackend._fit_chain((1080, 1920), (1920, 1080), (1920, 1080)))
+    assert "[bg]" not in chain, "the solid slide background already owns [bg]"
+
+
+def test_theme_colour_is_converted_to_the_form_ffmpeg_accepts():
+    assert ffmpeg_colour("#0B1220") == "0x0B1220"
+    assert ffmpeg_colour("0b1220") == "0x0B1220"
+    with pytest.raises(Exception, match="RRGGBB"):
+        ffmpeg_colour("rebeccapurple")
+
+
+def test_the_background_is_the_themes_colour_not_a_hardcoded_one():
+    backend = FFmpegBackend(text_mode="scrim", theme=Theme(bg="#123456"))
+    graph = _graph(backend, VisualPlan(layout=SlideLayout.TITLE_CARD), HD)
+    assert "color=c=0x123456:s=1920x1080:r=30[bg]" in graph
+
+
+def test_hero_panels_get_rounded_corners_and_full_bleed_does_not():
+    backend = FFmpegBackend(text_mode="scrim")
+    hero = _graph(backend, VisualPlan(layout=SlideLayout.HERO_RIGHT), HD, src_size=(2752, 1536))
+    assert "alphamerge" in hero, "rounded corners are an alpha mask"
+    assert "loop=loop=-1:size=1" in hero, "the mask is static; evaluate geq once"
+    assert "geq=lum=" in hero
+
+    bleed = _graph(backend, VisualPlan(layout=SlideLayout.FULL_BLEED), HD)
+    assert "alphamerge" not in bleed, "a full-bleed image IS the frame"
+
+
+# ============================================================ text animation
+
+
+def _eval_expr(expression: str, **variables: float) -> float:
+    """Evaluate an ffmpeg expression as Python. The subset we emit is compatible."""
+    scope = {"min": min, "max": max, "pow": pow}
+    return float(eval(expression, {"__builtins__": {}}, scope | variables))  # noqa: S307
+
+
+def fake_layer(**kwargs) -> TextLayer:
+    """A TextLayer without touching text_overlay -- the contract is the only coupling."""
+    defaults = dict(
+        png_path=Path("/tmp/layer.png"),
+        x=120,
+        y=400,
+        width=800,
+        height=60,
+        appear_at=1.0,
+        animation=TextAnimation.FADE_IN,
+        anim_duration=0.4,
+        slide_distance=60,
+        kind="bullet",
+    )
+    return TextLayer(**(defaults | kwargs))
+
+
+def fake_scene_text(count: int = 4, *, first: float = 0.5, step: float = 1.0) -> SceneText:
+    """A scrim, a heading, and ``count`` staggered bullets."""
+    layers = [
+        TextLayer(
+            png_path=Path("/tmp/scrim.png"),
+            x=0,
+            y=0,
+            width=1920,
+            height=1080,
+            appear_at=0.0,
+            animation=TextAnimation.FADE_IN,
+            anim_duration=0.3,
+            kind="scrim",
+        ),
+        fake_layer(appear_at=0.2, animation=TextAnimation.SLIDE_UP, kind="heading", y=120),
+    ]
+    for index in range(count):
+        layers.append(
+            fake_layer(
+                png_path=Path(f"/tmp/b{index}.png"),
+                appear_at=first + index * step,
+                y=400 + index * 90,
+                animation=TextAnimation.SLIDE_LEFT,
+            )
+        )
+    return SceneText(layers=layers)
+
+
+def test_a_layer_is_fully_transparent_before_its_appear_at():
+    """The classic bug: the PNG shows from frame 0 and every reveal is spoiled.
+
+    ``fade=t=in`` with ``st>0`` holds alpha at zero for every earlier frame, and the
+    ``enable`` gate skips the overlay entirely. Both are asserted because the fade is
+    what makes it correct and the gate is what makes it cheap.
+    """
+    layer = fake_layer(appear_at=1.25, anim_duration=0.4)
+    prep = FFmpegBackend._layer_prep(layer, fps=30)
+
+    assert "format=rgba" in prep, "fade cannot touch an alpha channel that is not there"
+    assert prep.index("format=rgba") < prep.index("fade="), "alpha must exist first"
+    assert "fade=t=in:st=1.2500:d=0.4000:alpha=1" in prep
+    assert FFmpegBackend._visibility_expr(layer, fps=30) == "gte(t,1.2500)"
+
+
+def test_alpha_fade_is_the_only_thing_that_interpolates_opacity():
+    """`enable` cannot interpolate, so it must never be the whole mechanism."""
+    layer = fake_layer(animation=TextAnimation.FADE_IN, appear_at=2.0, anim_duration=0.5)
+    prep = FFmpegBackend._layer_prep(layer, fps=30)
+    assert "alpha=1" in prep, "without alpha=1 the fade goes to black, not transparent"
+    assert ":d=0.5000" in prep
+
+
+def test_disappear_at_gets_a_matching_fade_out_and_a_bounded_gate():
+    layer = fake_layer(appear_at=1.0, disappear_at=4.0, anim_duration=0.4)
+    prep = FFmpegBackend._layer_prep(layer, fps=30)
+    assert "fade=t=out:st=4.0000:d=0.4000:alpha=1" in prep
+    assert prep.index("fade=t=in") < prep.index("fade=t=out")
+    gate = FFmpegBackend._visibility_expr(layer, fps=30)
+    assert gate.startswith("between(t,1.0000,")
+    assert _eval_expr(gate.replace("between(t,", "").split(",")[1].rstrip(")")) > 4.0
+
+
+def test_a_layer_with_no_disappear_time_stays_to_the_end():
+    prep = FFmpegBackend._layer_prep(fake_layer(disappear_at=None), fps=30)
+    assert "fade=t=out" not in prep
+
+
+@pytest.mark.parametrize("fps", [12, 24, 30, 60])
+def test_none_and_typewriter_appear_within_a_single_frame(fps):
+    """Instant, but never visible early: a one-frame ramp still gates frame 0."""
+    for animation in (TextAnimation.NONE, TextAnimation.TYPEWRITER):
+        layer = fake_layer(animation=animation, anim_duration=0.5)
+        assert FFmpegBackend._fade_in(layer, fps=fps) == pytest.approx(1 / fps)
+
+
+def test_pop_fades_faster_than_it_moves():
+    layer = fake_layer(animation=TextAnimation.POP, anim_duration=0.5)
+    assert FFmpegBackend._fade_in(layer, fps=30) < layer.anim_duration
+    assert FFmpegBackend._fade_in(layer, fps=30) == pytest.approx(0.3)
+
+
+def test_slide_up_travels_from_below_and_lands_exactly_on_target():
+    layer = fake_layer(animation=TextAnimation.SLIDE_UP, appear_at=1.0, anim_duration=0.4, y=400)
+    x_expr, y_expr = FFmpegBackend._anim_position(layer)
+
+    assert x_expr == "120", "a vertical slide must not move horizontally"
+    assert _eval_expr(y_expr, t=0.0) == pytest.approx(460), "starts slide_distance below"
+    assert _eval_expr(y_expr, t=1.0) == pytest.approx(460)
+    assert _eval_expr(y_expr, t=1.4) == pytest.approx(400), "lands on the final y"
+    assert _eval_expr(y_expr, t=1.2) < 460, "and it actually moved in between"
+
+
+def test_slide_left_travels_from_the_right_and_lands_exactly_on_target():
+    layer = fake_layer(animation=TextAnimation.SLIDE_LEFT, appear_at=2.0, anim_duration=0.5, x=120)
+    x_expr, y_expr = FFmpegBackend._anim_position(layer)
+
+    assert y_expr == "400"
+    assert _eval_expr(x_expr, t=0.0) == pytest.approx(180)
+    assert _eval_expr(x_expr, t=2.5) == pytest.approx(120)
+    assert 120 < _eval_expr(x_expr, t=2.25) < 180
+
+
+@pytest.mark.parametrize(
+    "animation", [TextAnimation.SLIDE_UP, TextAnimation.SLIDE_LEFT, TextAnimation.POP]
+)
+def test_position_is_clamped_to_the_final_value_forever_after(animation):
+    """An unclamped ramp keeps travelling for the rest of the scene."""
+    layer = fake_layer(animation=animation, appear_at=1.0, anim_duration=0.4, x=120, y=400)
+    x_expr, y_expr = FFmpegBackend._anim_position(layer)
+    for t in (1.4, 1.5, 3.0, 10.0, 600.0):
+        assert _eval_expr(x_expr, t=t) == pytest.approx(120), t
+        assert _eval_expr(y_expr, t=t) == pytest.approx(400), t
+
+
+@pytest.mark.parametrize(
+    "animation", [TextAnimation.SLIDE_UP, TextAnimation.SLIDE_LEFT, TextAnimation.POP]
+)
+def test_position_is_pinned_at_the_start_value_before_appear_at(animation):
+    layer = fake_layer(animation=animation, appear_at=2.0, anim_duration=0.4)
+    x_expr, y_expr = FFmpegBackend._anim_position(layer)
+    for t in (0.0, 0.5, 1.99, 2.0):
+        assert _eval_expr(x_expr, t=t) == pytest.approx(_eval_expr(x_expr, t=0.0)), t
+        assert _eval_expr(y_expr, t=t) == pytest.approx(_eval_expr(y_expr, t=0.0)), t
+
+
+def test_slides_are_eased_not_linear():
+    """A linear slide starts and stops abruptly and reads as mechanical.
+
+    Smoothstep has zero velocity at both ends, so the first and last steps of the
+    move are a fraction of the mid-move step.
+    """
+    layer = fake_layer(animation=TextAnimation.SLIDE_UP, appear_at=0.0, anim_duration=1.0)
+    _, y_expr = FFmpegBackend._anim_position(layer)
+
+    first = abs(_eval_expr(y_expr, t=0.05) - _eval_expr(y_expr, t=0.0))
+    middle = abs(_eval_expr(y_expr, t=0.55) - _eval_expr(y_expr, t=0.5))
+    last = abs(_eval_expr(y_expr, t=1.0) - _eval_expr(y_expr, t=0.95))
+
+    assert first < middle / 4, f"eases in: {first} vs {middle}"
+    assert last < middle / 4, f"eases out: {last} vs {middle}"
+    # And the midpoint of a smoothstep is exactly halfway.
+    assert _eval_expr(y_expr, t=0.5) == pytest.approx(430)
+
+
+def test_pop_overshoots_past_its_target_then_settles():
+    """POP is approximated as a positional overshoot -- see _anim_position."""
+    layer = fake_layer(animation=TextAnimation.POP, appear_at=0.0, anim_duration=1.0, y=400)
+    _, y_expr = FFmpegBackend._anim_position(layer)
+
+    assert _eval_expr(y_expr, t=0.0) == pytest.approx(420), "starts below the mark"
+    overshoot = min(_eval_expr(y_expr, t=t / 100) for t in range(0, 101))
+    assert overshoot < 400, f"never went past the target: {overshoot}"
+    assert overshoot > 392, f"overshoot must stay subtle, not bounce: {overshoot}"
+    assert _eval_expr(y_expr, t=1.0) == pytest.approx(400), "settles exactly on target"
+
+
+def test_none_and_fade_in_do_not_move_the_layer():
+    for animation in (TextAnimation.NONE, TextAnimation.FADE_IN, TextAnimation.TYPEWRITER):
+        x_expr, y_expr = FFmpegBackend._anim_position(fake_layer(animation=animation))
+        assert (x_expr, y_expr) == ("120", "400"), animation
+
+
+def test_typewriter_is_a_left_to_right_alpha_wipe():
+    """Documented approximation: without drawtext there is no glyph-level clock."""
+    layer = fake_layer(animation=TextAnimation.TYPEWRITER, appear_at=1.0, anim_duration=0.8)
+    prep = FFmpegBackend._layer_prep(layer, fps=30)
+
+    assert "geq=" in prep and "alpha(X,Y)" in prep
+    assert prep.index("format=rgba") < prep.index("geq=")
+    reveal = FFmpegBackend._wipe_filter(layer)
+    fraction = reveal.split("lt(X,W*")[1].split(")),")[0] + ")"
+    assert _eval_expr(fraction, T=0.0) == pytest.approx(0.0), "nothing revealed early"
+    assert _eval_expr(fraction, T=1.4) == pytest.approx(0.5), "half way through"
+    assert _eval_expr(fraction, T=5.0) == pytest.approx(1.0), "fully revealed and clamped"
+
+
+# ------------------------------------------------------------- chain assembly
+
+
+def test_layers_are_overlaid_in_sorted_order_scrim_first():
+    """The scrim must land *under* the type it exists to make legible."""
+    scene_text = fake_scene_text(count=3)
+    parts, final = FFmpegBackend(text_mode="scrim")._text_chain(
+        scene_text, base="base", first_input=1, fps=30
+    )
+    graph = ";".join(parts)
+    kinds = [layer.kind for layer in scene_text.sorted_layers()]
+
+    assert kinds == ["scrim", "heading", "bullet", "bullet", "bullet"]
+    assert final == "ov4", "the last overlay's label is what the caller composites"
+    # Overlay stages are strictly chained: each consumes the previous one's output.
+    assert "[base][tl0]overlay=" in graph
+    for index in range(1, 5):
+        assert f"[ov{index - 1}][tl{index}]overlay=" in graph
+
+
+def test_every_filtergraph_label_is_unique_across_seven_layers():
+    """A duplicate label is a parse error, and 1 scrim + 1 heading + 5 bullets is legal."""
+    scene_text = fake_scene_text(count=5)
+    assert len(scene_text.layers) == 7
+    parts, _ = FFmpegBackend(text_mode="scrim")._text_chain(
+        scene_text, base="base", first_input=1, fps=30
+    )
+    produced = [part.rsplit("[", 1)[1].rstrip("]") for part in parts]
+    assert len(produced) == len(set(produced)), produced
+
+
+def test_each_layer_reads_its_own_input_index():
+    scene_text = fake_scene_text(count=4)
+    parts, _ = FFmpegBackend(text_mode="scrim")._text_chain(
+        scene_text, base="base", first_input=1, fps=30
+    )
+    graph = ";".join(parts)
+    for index in range(len(scene_text.layers)):
+        assert f"[{index + 1}:v]format=rgba" in graph
+
+
+def test_text_layers_start_at_input_zero_when_the_slide_has_no_image():
+    parts, _ = FFmpegBackend(text_mode="scrim")._text_chain(
+        fake_scene_text(count=1), base="bg", first_input=0, fps=30
+    )
+    assert "[0:v]format=rgba" in ";".join(parts)
+
+
+def test_animated_layers_ask_for_per_frame_evaluation_and_static_ones_do_not():
+    """`eval=frame` is required for a time-varying expression and wasted otherwise."""
+    backend = FFmpegBackend(text_mode="scrim")
+    moving = SceneText(layers=[fake_layer(animation=TextAnimation.SLIDE_UP)])
+    still = SceneText(layers=[fake_layer(animation=TextAnimation.FADE_IN)])
+
+    assert "eval=frame" in ";".join(backend._text_chain(moving, base="b", first_input=1, fps=30)[0])
+    assert "eval=init" in ";".join(backend._text_chain(still, base="b", first_input=1, fps=30)[0])
+
+
+def test_scene_graph_composites_every_layer_and_ends_in_yuv420p():
+    plan = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.ZOOM_IN)
+    graph = _graph(
+        FFmpegBackend(text_mode="scrim"),
+        plan,
+        HD,
+        src_size=(2752, 1536),
+        scene_text=fake_scene_text(count=4),
+    )
+    assert graph.count("overlay=") == 1 + 6, "one for the hero panel, one per text layer"
+    assert graph.endswith("format=yuv420p[vout]")
+    assert graph.count("[vout]") == 1
+
+
+def test_too_many_text_layers_is_refused_rather_than_rendered(tmp_path):
+    from app.render.ffmpeg_backend import MAX_TEXT_LAYERS, RenderError
+
+    backend = FFmpegBackend(text_mode="scrim")
+    crowded = SceneText(layers=[fake_layer() for _ in range(MAX_TEXT_LAYERS + 1)])
+    with pytest.raises(RenderError, match="exceeds"):
+        backend.render_scene(
+            None, VisualPlan(layout=SlideLayout.TITLE_CARD), "Hi", 1.0,
+            tmp_path / "nope.mp4", HD, scene_text=crowded,
+        )
+
+
+def test_scene_graph_construction_holds_no_shared_state():
+    """Scenes render on four threads; two graphs built from the same inputs must match
+    and must not influence each other."""
+    backend = FFmpegBackend(text_mode="scrim")
+    plans = [
+        VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.ZOOM_IN),
+        VisualPlan(layout=SlideLayout.HERO_LEFT, motion=Motion.PAN_LEFT),
+    ]
+    first = [_graph(backend, plan, HD, src_size=(2752, 1536)) for plan in plans]
+    second = [_graph(backend, plan, HD, src_size=(2752, 1536)) for plan in reversed(plans)]
+    assert first == list(reversed(second))
 
 
 # ================================================================ image fitting
@@ -732,6 +1496,110 @@ def test_assembled_duration_matches_final_duration(assets, tmp_path):
 
 
 @integration
+@needs_magick
+def test_branding_is_duration_neutral_and_survives_every_transition(assets, tmp_path):
+    """The two things the watermark must not do: shift timing, or pulse at a boundary.
+
+    The transition here is ``slideleft`` on purpose. A logo burnt into each scene clip
+    literally slides off the left edge with the outgoing frame, so a wipe or a slide is a
+    far harsher test than a crossfade — and it is what the planner's rotation actually
+    picks for the second boundary.
+    """
+    scenes = [
+        Scene(
+            id=index + 1,
+            narration="n",
+            heading=f"Slide {index + 1}",
+            image_prompt="p",
+            image_path=str(assets["landscape"] if index % 2 == 0 else assets["portrait"]),
+            start=float(index),
+            end=float(index + 1),
+            plan=VisualPlan(
+                layout=SlideLayout.HERO_RIGHT,
+                motion=Motion.STATIC,
+                transition_in=Transition.FADE if index == 0 else Transition.SLIDE_LEFT,
+                transition_duration=0.0 if index == 0 else 0.25,
+            ),
+        )
+        for index in range(3)
+    ]
+    timeline = Timeline(
+        job_id="brand", topic="t", title="T", voice="v", profile=TINY, scenes=scenes
+    )
+    backend = FFmpegBackend()
+    if backend.logo_source is None:
+        pytest.skip("no logo source available")
+    timeline = backend.render_all(timeline, tmp_path)
+
+    branded = backend.assemble(timeline, tmp_path / "branded.mp4")
+    plain = FFmpegBackend(logo_path=None).assemble(timeline, tmp_path / "plain.mp4")
+
+    expected = timeline.final_duration()
+    branded_d, plain_d = ff.probe_duration(branded), ff.probe_duration(plain)
+    assert branded_d == pytest.approx(expected, abs=max(0.1, 4 / FPS))
+    assert branded_d == pytest.approx(plain_d, abs=1 / FPS), "the overlay shifted the timing"
+
+    logo = backend.logo_png(TINY, tmp_path)
+    assert logo is not None
+    region = backend.logo_region(TINY, logo)
+    binary = text_overlay.require_imagemagick()
+    mask = tmp_path / "mask.png"
+    # Alpha is pre-multiplied by theme.logo_opacity, so "opaque" is that, not 1.0.
+    threshold = int(backend.theme.logo_opacity * 90)
+    subprocess.run(  # noqa: S603
+        [binary, str(logo), "-alpha", "extract", "-threshold", f"{threshold}%", str(mask)],
+        check=True,
+    )
+
+    durations = [ff.probe_duration(s.clip_path) for s in timeline.scenes]
+    _, starts, chain = backend._video_chain(timeline, durations)
+    stamps = [starts[0] + durations[0] / 2]
+    for index in range(1, len(scenes)):
+        boundary = starts[index]
+        half = scenes[index].plan.transition_duration / 2
+        stamps += [boundary + half, starts[index] + durations[index] / 2]
+
+    def logo_lift(video: Path, when: float) -> float:
+        """Blue lift of the mark's core over a logo-free control patch of the same frame.
+
+        The picture behind the logo changes at every boundary, so an absolute reading
+        cannot tell "the logo faded" from "the scene changed". A difference can.
+        """
+        frame = tmp_path / f"f{video.stem}{when:.3f}.png"
+        ff.ffmpeg(["-ss", f"{when:.4f}", "-i", video, "-frames:v", "1", frame])
+        crop = tmp_path / "crop.png"
+        subprocess.run(  # noqa: S603
+            [binary, str(frame), "-crop",
+             f"{region.width}x{region.height}+{region.x}+{region.y}", "+repage", str(crop)],
+            check=True,
+        )
+        masked = tmp_path / "masked.png"
+        subprocess.run(  # noqa: S603
+            [binary, str(crop), str(mask), "-compose", "Multiply", "-composite", str(masked)],
+            check=True,
+        )
+        core_b = float(subprocess.run(  # noqa: S603
+            [binary, str(masked), "-format", "%[fx:mean.b]", "info:"],
+            capture_output=True, text=True, check=True).stdout)
+        share = float(subprocess.run(  # noqa: S603
+            [binary, str(mask), "-format", "%[fx:mean]", "info:"],
+            capture_output=True, text=True, check=True).stdout)
+        control_b = float(subprocess.run(  # noqa: S603
+            [binary, str(frame), "-crop",
+             f"{region.width}x{region.height}+{region.x + 3 * region.width}+{region.y}",
+             "+repage", "-format", "%[fx:mean.b]", "info:"],
+            capture_output=True, text=True, check=True).stdout)
+        return 255 * (core_b / max(share, 1e-6) - control_b)
+
+    lifts = [logo_lift(branded, when) for when in stamps]
+    assert all(lift > 60 for lift in lifts), f"the mark is missing somewhere: {lifts}"
+    # Constant, not merely present: the spread across the whole video stays small.
+    assert max(lifts) - min(lifts) < 0.35 * max(lifts), f"the mark pulses: {lifts}"
+    # And with branding off there is nothing there, so the metric is measuring the logo.
+    assert logo_lift(plain, stamps[0]) < 40
+
+
+@integration
 def test_assemble_refuses_to_lie_about_a_duration_mismatch(assets, tmp_path):
     from app.render.ffmpeg_backend import DurationMismatchError
 
@@ -766,7 +1634,13 @@ def test_upscaling_removes_the_zoompan_stepping(assets, tmp_path):
     """
     # Deliberately slow: 640/1.05 leaves ~30px of travel spread over 120 frames, i.e.
     # a quarter of a pixel per frame -- exactly where integer truncation shows up.
-    plan = VisualPlan(motion=Motion.PAN_RIGHT, zoom_from=1.05, zoom_to=1.05, easing="linear")
+    plan = VisualPlan(
+        layout=SlideLayout.FULL_BLEED,
+        motion=Motion.PAN_RIGHT,
+        zoom_from=1.05,
+        zoom_to=1.05,
+        easing="linear",
+    )
     pan_fps, pan_seconds = 30, 4.0
     duplicates = {}
     for upscale in (1, 4):
@@ -787,6 +1661,96 @@ def test_upscaling_removes_the_zoompan_stepping(assets, tmp_path):
 
     assert duplicates[1] > 0, f"expected visible stepping without pre-upscaling: {duplicates}"
     assert duplicates[4] < duplicates[1] / 2, f"upscaling did not help: {duplicates}"
+
+
+def _pixel(frame: Path, x: int, y: int) -> tuple[int, int, int]:
+    """One RGB pixel out of an image, straight from ffmpeg's raw output.
+
+    Reading pixels beats reading ``signalstats`` metadata: the metadata filter prints
+    at INFO level, which the wrapper's ``-loglevel error`` swallows.
+    """
+    raw = subprocess.run(  # noqa: S603
+        [
+            ff.ffmpeg_bin(), "-hide_banner", "-nostdin", "-v", "error",
+            "-i", str(frame), "-vf", f"crop=2:2:{x}:{y},format=rgb24",
+            "-f", "rawvideo", "-",
+        ],
+        capture_output=True,
+        check=True,
+    ).stdout
+    return raw[0], raw[1], raw[2]
+
+
+@integration
+def test_text_layers_really_appear_one_at_a_time_in_a_rendered_clip(assets, tmp_path):
+    """The proof the unit tests cannot give: render it and count what is on screen.
+
+    Three bars enter at 0.3s / 0.9s / 1.5s over a solid background. A passing
+    expression test does not mean ffmpeg agreed, so this reads the actual pixels.
+    """
+    profile = RenderProfile(width=320, height=180, fps=30, upscale_factor=1, crf=20)
+    layers = []
+    for index in range(3):
+        png = tmp_path / f"bar{index}.png"
+        ff.ffmpeg(
+            ["-f", "lavfi", "-i", "color=c=white:s=120x20,format=rgba", "-frames:v", "1", png]
+        )
+        layers.append(
+            TextLayer(
+                png_path=png,
+                x=40,
+                y=30 + index * 40,
+                width=120,
+                height=20,
+                appear_at=0.3 + index * 0.6,
+                animation=TextAnimation.SLIDE_LEFT,
+                anim_duration=0.25,
+                slide_distance=30,
+                kind="bullet",
+            )
+        )
+
+    clip = FFmpegBackend(text_mode="scrim").render_scene(
+        None,
+        VisualPlan(layout=SlideLayout.TITLE_CARD, motion=Motion.STATIC),
+        "",
+        2.2,
+        tmp_path / "anim.mp4",
+        profile,
+        scene_text=SceneText(layers=layers),
+    )
+
+    def white_bars(t: float) -> int:
+        """How many of the three bar rows are lit at time ``t``."""
+        frame = tmp_path / f"f{t}.png"
+        ff.ffmpeg(["-ss", str(t), "-i", clip, "-frames:v", "1", frame])
+        return sum(
+            _pixel(frame, 100, 38 + index * 40)[0] > 128 for index in range(3)
+        )
+
+    assert white_bars(0.1) == 0, "nothing may be visible before the first appear_at"
+    assert white_bars(0.7) == 1
+    assert white_bars(1.3) == 2
+    assert white_bars(2.0) == 3, "every layer must be on screen by the end"
+
+
+@integration
+def test_a_rendered_slide_keeps_the_solid_background_outside_the_image_region(assets, tmp_path):
+    """A hero panel must not bleed into the frame: the margin stays brand colour."""
+    profile = RenderProfile(width=640, height=360, fps=24, upscale_factor=2, crf=20)
+    plan = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.ZOOM_IN)
+    region = layout_region(plan, profile)
+    clip = FFmpegBackend(text_mode="scrim", theme=Theme(bg="#101010")).render_scene(
+        assets["landscape"], plan, "", 0.5, tmp_path / "hero.mp4", profile
+    )
+
+    frame = tmp_path / "hero.png"
+    ff.ffmpeg(["-ss", "0.2", "-i", clip, "-frames:v", "1", frame])
+
+    margin = _pixel(frame, max(0, region.x - 16), region.y + 8)
+    inside = _pixel(frame, region.x + region.width // 2, region.y + region.height // 2)
+    assert max(margin) < 40, f"margin should be the near-black theme colour, got {margin}"
+    assert inside != margin, "the image region must actually contain the image"
 
 
 @integration
@@ -811,3 +1775,11 @@ def test_expected_duration_helper_matches_the_model():
     timeline = RuleBasedPlanner().plan(make_timeline([3.3, 1.7, 2.9, 4.1]))
     assert expected_assembled_duration(timeline) == pytest.approx(timeline.final_duration())
     assert not math.isnan(expected_assembled_duration(timeline))
+
+
+def test_the_per_process_thread_cap_reaches_the_concurrent_scene_encode():
+    """render_all divides the box between workers; the scene encode is the process
+    that runs concurrently, so the cap has to land there and not only on assemble."""
+    profile = RenderProfile(encoder_threads=3)
+    assert FFmpegBackend._thread_args(profile) == ["-threads", "3"]
+    assert FFmpegBackend._thread_args(RenderProfile()) == [], "0/None means let ffmpeg decide"

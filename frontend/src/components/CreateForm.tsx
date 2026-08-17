@@ -1,55 +1,234 @@
-import { useState, type FormEvent } from 'react'
-import { InfoIcon, Loader2Icon, MusicIcon, SparklesIcon, WandSparklesIcon } from 'lucide-react'
+import { useMemo, useState, type FormEvent } from 'react'
+import {
+  AlertTriangleIcon,
+  AudioLinesIcon,
+  InfoIcon,
+  ListChecksIcon,
+  Loader2Icon,
+  MusicIcon,
+  PaletteIcon,
+  SparklesIcon,
+  UsersIcon,
+  WandSparklesIcon,
+} from 'lucide-react'
 
+import { EngineSelector } from '@/components/EngineSelector'
+import { SlidePreview } from '@/components/SlidePreview'
+import { ThemePicker } from '@/components/ThemePicker'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import { Slider } from '@/components/ui/slider'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { VoicePicker } from '@/components/VoicePicker'
-import { DEFAULT_VOICE_ID } from '@/lib/api'
-import type { CreateJobRequest, Voice } from '@/lib/types'
+import { FALLBACK_THEMES, preferredVoiceId } from '@/lib/api'
+import { evaluatePalette, formatRatio, type Palette } from '@/lib/contrast'
+import {
+  CUSTOM_THEME_ID,
+  DEFAULT_BULLETS,
+  DEFAULT_THEME_ID,
+  DEFAULT_TONE,
+  MAX_BULLETS,
+  MIN_BULLETS,
+  TONE_OPTIONS,
+  type CreateJobRequest,
+  type SpeechEngine,
+  type ThemeContrastFailure,
+  type ThemePreset,
+  type Tone,
+  type Voice,
+} from '@/lib/types'
 
 const MIN_SLIDES = 2
 const MAX_SLIDES = 10
 const DEFAULT_SLIDES = 4
 
 const EXAMPLE_TOPICS = [
-  'How black holes bend time',
-  'The rise and fall of the Silk Road',
-  'Why the ocean is salty',
-  'How sourdough starter actually works',
+  'Spotting business email compromise',
+  'Handling customer data safely',
+  'What to do in a security incident',
+  'Password managers and why we use one',
 ]
 
+const TONE_VALUES = new Set<string>(TONE_OPTIONS.map((option) => option.value))
+
+function isTone(value: string): value is Tone {
+  return TONE_VALUES.has(value)
+}
+
+/** Seeds the custom editor and the preview before the catalogue has loaded. */
+const SEED_PALETTE: Palette = FALLBACK_THEMES.find(
+  (theme) => theme.id === DEFAULT_THEME_ID,
+)?.swatches ?? {
+  bg: '#0B1220',
+  surface: '#131F35',
+  text: '#F8FAFC',
+  muted: '#94A3B8',
+  accent: '#F5A524',
+}
+
 interface CreateFormProps {
+  engines: SpeechEngine[]
+  enginesLoading: boolean
+  usedFallbackEngines: boolean
+  /** Selected engine id — owned above, because the voice list is fetched from it. */
+  engineId: string
+  onSelectEngine: (engineId: string) => void
   voices: Voice[]
   voicesLoading: boolean
   usedFallbackVoices: boolean
+  /** The server returned another engine's voices; the built-in list stood in. */
+  voicesEngineMismatch: boolean
+  themes: ThemePreset[]
+  themesLoading: boolean
+  usedFallbackThemes: boolean
+  /** A palette the server has rejected — cleared when the palette changes. */
+  contrastFailure: ThemeContrastFailure | null
+  onDismissContrastFailure: () => void
   isSubmitting: boolean
   onSubmit: (request: CreateJobRequest) => void
 }
 
 export function CreateForm({
+  engines,
+  enginesLoading,
+  usedFallbackEngines,
+  engineId,
+  onSelectEngine,
   voices,
   voicesLoading,
   usedFallbackVoices,
+  voicesEngineMismatch,
+  themes,
+  themesLoading,
+  usedFallbackThemes,
+  contrastFailure,
+  onDismissContrastFailure,
   isSubmitting,
   onSubmit,
 }: CreateFormProps) {
   const [topic, setTopic] = useState('')
   const [slideCount, setSlideCount] = useState(DEFAULT_SLIDES)
-  const [voice, setVoice] = useState(DEFAULT_VOICE_ID)
+  const [bulletCount, setBulletCount] = useState(DEFAULT_BULLETS)
+  const [tone, setTone] = useState<Tone>(DEFAULT_TONE)
   const [music, setMusic] = useState(true)
   const [touched, setTouched] = useState(false)
 
+  /**
+   * The voice the user picked, tagged with the engine it was picked for.
+   *
+   * Stored as a pair and *derived* below rather than reset by an effect: a voice
+   * id is only meaningful to one engine, so the selection has to be invalidated
+   * the instant the engine changes. An effect would leave one render — and one
+   * possible submit — in which a Deepgram id sat in the form under Polly, which
+   * is exactly the 400 this selector exists to prevent.
+   */
+  const [voiceChoice, setVoiceChoice] = useState<{ engine: string; id: string } | null>(null)
+
+  const selectedEngine = engines.find((engine) => engine.id === engineId) ?? null
+
+  const voice = useMemo(() => {
+    if (
+      voiceChoice !== null &&
+      voiceChoice.engine === engineId &&
+      voices.some((candidate) => candidate.id === voiceChoice.id)
+    ) {
+      return voiceChoice.id
+    }
+    // The server's `default_voice` for this engine wins, then the built-in
+    // preference, then the head of the catalogue.
+    return preferredVoiceId(engineId, voices, selectedEngine?.default_voice)
+  }, [voiceChoice, engineId, voices, selectedEngine?.default_voice])
+
+  /** A preset id, or `custom`. */
+  const [themeId, setThemeId] = useState<string>(DEFAULT_THEME_ID)
+  const [customPalette, setCustomPalette] = useState<Palette>(SEED_PALETTE)
+  /** Until the editor is opened, the custom palette follows the selected preset. */
+  const [customSeeded, setCustomSeeded] = useState(false)
+
+  const isCustomTheme = themeId === CUSTOM_THEME_ID
+
+  // The catalogue arrives asynchronously and its ids are the server's, so the
+  // selection is resolved at render rather than assumed to exist.
+  const selectedPreset =
+    themes.find((theme) => theme.id === themeId) ??
+    themes.find((theme) => theme.is_default) ??
+    themes[0] ??
+    null
+
+  const activePalette: Palette = isCustomTheme
+    ? customPalette
+    : (selectedPreset?.swatches ?? SEED_PALETTE)
+
+  const report = useMemo(() => evaluatePalette(activePalette), [activePalette])
+
+  /**
+   * Only a custom palette can block submission, and only below WCAG AA — the
+   * same floor the server enforces. Anything between AA and the 7.0 we
+   * recommend is a warning shown in the editor, not a refusal: plenty of real
+   * brand colours live there.
+   *
+   * Presets never block: they come from the server's own validated registry, so
+   * refusing one it offered would be a dead end.
+   */
+  const paletteBlocks = isCustomTheme && !report.isValid
+
   const trimmedTopic = topic.trim()
   const topicInvalid = touched && trimmedTopic === ''
+  const selectedTone = TONE_OPTIONS.find((option) => option.value === tone) ?? TONE_OPTIONS[1]
+
+  const handleSelectPreset = (id: string): void => {
+    setThemeId(id)
+    onDismissContrastFailure()
+    // Keep the unopened editor tracking the preset, so opening it starts from
+    // the palette on screen rather than from an unrelated default.
+    if (!customSeeded) {
+      const preset = themes.find((theme) => theme.id === id)
+      if (preset !== undefined) setCustomPalette(preset.swatches)
+    }
+  }
+
+  const handleSelectCustom = (): void => {
+    if (!customSeeded && selectedPreset !== null) setCustomPalette(selectedPreset.swatches)
+    setThemeId(CUSTOM_THEME_ID)
+  }
+
+  const handleChangeCustom = (palette: Palette): void => {
+    setCustomPalette(palette)
+    setCustomSeeded(true)
+    // The rejection belongs to the palette that caused it, not to this one.
+    onDismissContrastFailure()
+  }
 
   const handleSubmit = (event: FormEvent<HTMLFormElement>): void => {
     event.preventDefault()
     setTouched(true)
-    if (trimmedTopic === '') return
-    onSubmit({ topic: trimmedTopic, slide_count: slideCount, voice, music })
+    if (trimmedTopic === '' || paletteBlocks) return
+
+    const request: CreateJobRequest = {
+      topic: trimmedTopic,
+      slide_count: slideCount,
+      // `voice` is derived from `engineId`, so the pair is consistent by
+      // construction — there is no state in which they can disagree.
+      voice,
+      music,
+      tts_engine: engineId,
+      theme: isCustomTheme ? CUSTOM_THEME_ID : (selectedPreset?.id ?? DEFAULT_THEME_ID),
+      bullets_per_slide: bulletCount,
+      tone,
+    }
+    // Sent only in custom mode: `ThemeCustom` forbids extra keys and requires
+    // all five colours, so it is all or nothing.
+    if (isCustomTheme) request.theme_custom = customPalette
+
+    onSubmit(request)
   }
 
   return (
@@ -128,22 +307,185 @@ export function CreateForm({
         </div>
       </div>
 
+      {/* Bullets per slide --------------------------------------------- */}
+      <div className="space-y-4">
+        <div className="flex items-center justify-between">
+          <Label
+            htmlFor="bullets"
+            className="flex items-center gap-2 text-sm font-medium text-white/80"
+          >
+            <ListChecksIcon className="size-3.5 text-violet-300/70" />
+            Bullet points per slide
+          </Label>
+          <span className="rounded-md border border-violet-400/20 bg-violet-500/10 px-2 py-0.5 font-mono text-sm text-violet-200 tabular-nums">
+            {bulletCount}
+          </span>
+        </div>
+
+        <Slider
+          id="bullets"
+          min={MIN_BULLETS}
+          max={MAX_BULLETS}
+          step={1}
+          value={[bulletCount]}
+          onValueChange={(values) => {
+            const next = values[0]
+            if (next !== undefined) setBulletCount(next)
+          }}
+          className="py-1"
+        />
+
+        <div className="flex justify-between text-xs text-white/25">
+          <span>{MIN_BULLETS} — tight</span>
+          <span>{MAX_BULLETS} — thorough</span>
+        </div>
+
+        <p className="text-xs text-white/25">
+          Animated on screen in time with the narration, under each slide heading.
+        </p>
+      </div>
+
+      {/* Audience / tone ----------------------------------------------- */}
+      <div className="space-y-3">
+        <Label htmlFor="tone" className="flex items-center gap-2 text-sm font-medium text-white/80">
+          <UsersIcon className="size-3.5 text-violet-300/70" />
+          Audience
+        </Label>
+
+        <Select
+          value={tone}
+          onValueChange={(value) => {
+            // The Select is typed as `string`; narrow before it hits state.
+            if (isTone(value)) setTone(value)
+          }}
+        >
+          <SelectTrigger
+            id="tone"
+            className="h-auto w-full border-white/10 bg-white/[0.03] py-2.5 text-left text-white focus-visible:border-violet-400/50 focus-visible:ring-violet-500/20 [&>span]:min-w-0 [&>span]:flex-1"
+          >
+            <SelectValue>
+              <span className="truncate font-medium">{selectedTone.label}</span>
+            </SelectValue>
+          </SelectTrigger>
+
+          <SelectContent className="border-white/10 bg-neutral-900/95 backdrop-blur">
+            {TONE_OPTIONS.map((option) => (
+              <SelectItem
+                key={option.value}
+                value={option.value}
+                className="items-start py-2.5 text-white focus:bg-violet-500/15"
+              >
+                <span className="flex flex-col gap-0.5">
+                  <span className="text-sm font-medium">{option.label}</span>
+                  <span className="text-[11px] text-white/40">{option.hint}</span>
+                </span>
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+
+        <p className="text-xs text-white/25">{selectedTone.hint}</p>
+      </div>
+
+      {/* Brand theme --------------------------------------------------- */}
+      <div className="space-y-4">
+        <div className="flex items-baseline justify-between gap-3">
+          <Label className="flex items-center gap-2 text-sm font-medium text-white/80">
+            <PaletteIcon className="size-3.5 text-violet-300/70" />
+            Brand theme
+          </Label>
+          <span className="text-xs text-white/30">
+            {isCustomTheme ? 'Custom colours' : (selectedPreset?.name ?? '—')}
+          </span>
+        </div>
+
+        {/* Live preview of whatever is selected. Slides are a solid ground,
+            so the palette is the design — it has to be seen as a frame. */}
+        <figure className="space-y-2">
+          <div className="overflow-hidden rounded-xl border border-white/10 shadow-2xl shadow-black/40">
+            <SlidePreview palette={activePalette} />
+          </div>
+          <figcaption className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-white/30">
+            <span>Preview of a hero-right slide.</span>
+            <span>
+              Every word uses one colour — emphasis is weight and a larger marker, never a
+              second text colour.
+            </span>
+            <span className="font-mono text-white/40 tabular-nums">
+              text {formatRatio(report.checks[0]?.ratio ?? null)}:1
+            </span>
+          </figcaption>
+        </figure>
+
+        <ThemePicker
+          themes={themes}
+          isLoading={themesLoading}
+          usedFallback={usedFallbackThemes}
+          value={themeId}
+          customPalette={customPalette}
+          onSelectPreset={handleSelectPreset}
+          onSelectCustom={handleSelectCustom}
+          onChangeCustom={handleChangeCustom}
+          contrastFailure={contrastFailure}
+        />
+      </div>
+
+      {/* Speech engine ------------------------------------------------- */}
+      <div className="space-y-3">
+        <div className="flex items-baseline justify-between gap-3">
+          <Label className="flex items-center gap-2 text-sm font-medium text-white/80">
+            <AudioLinesIcon className="size-3.5 text-violet-300/70" />
+            Speech engine
+          </Label>
+          <span className="text-xs text-white/30">{selectedEngine?.name ?? engineId}</span>
+        </div>
+
+        <EngineSelector
+          engines={engines}
+          isLoading={enginesLoading}
+          usedFallback={usedFallbackEngines}
+          value={engineId}
+          onSelect={onSelectEngine}
+        />
+      </div>
+
       {/* Voice --------------------------------------------------------- */}
       <div className="space-y-3">
-        <Label htmlFor="voice" className="text-sm font-medium text-white/80">
-          Narrator voice
-        </Label>
+        <div className="flex items-baseline justify-between gap-3">
+          <Label htmlFor="voice" className="text-sm font-medium text-white/80">
+            Narrator voice
+          </Label>
+          {/* Named so it is obvious the list changed with the engine. */}
+          <span className="text-xs text-white/30">
+            {voices.length} {selectedEngine?.name ?? engineId} voice
+            {voices.length === 1 ? '' : 's'}
+          </span>
+        </div>
+
         <VoicePicker
           value={voice}
           voices={voices}
           isLoading={voicesLoading}
-          onChange={setVoice}
+          engine={selectedEngine}
+          onChange={(voiceId) => {
+            setVoiceChoice({ engine: engineId, id: voiceId })
+          }}
         />
-        {usedFallbackVoices && (
-          <p className="flex items-center gap-1.5 text-xs text-amber-300/70">
-            <InfoIcon className="size-3.5 shrink-0" />
-            Voice list unavailable — showing built-in Deepgram voices.
+
+        {voicesEngineMismatch ? (
+          <p className="flex items-start gap-1.5 text-xs text-amber-300/70">
+            <InfoIcon className="mt-px size-3.5 shrink-0" />
+            The server ignored the engine filter and returned another engine&rsquo;s voices —
+            showing the built-in {selectedEngine?.name ?? engineId} list instead, so the voice
+            sent matches the engine.
           </p>
+        ) : (
+          usedFallbackVoices && (
+            <p className="flex items-start gap-1.5 text-xs text-amber-300/70">
+              <InfoIcon className="mt-px size-3.5 shrink-0" />
+              Voice list unavailable — showing built-in {selectedEngine?.name ?? engineId} voices.
+            </p>
+          )
         )}
       </div>
 
@@ -167,29 +509,64 @@ export function CreateForm({
       </label>
 
       {/* Submit -------------------------------------------------------- */}
-      <Button
-        type="submit"
-        size="lg"
-        disabled={isSubmitting}
-        className="group relative w-full overflow-hidden bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-lg shadow-violet-950/40 transition-all hover:from-violet-500 hover:to-indigo-500 hover:shadow-violet-900/50 disabled:opacity-60"
-      >
-        {isSubmitting ? (
-          <>
-            <Loader2Icon className="size-4 animate-spin" />
-            Starting your video…
-          </>
-        ) : (
-          <>
-            <WandSparklesIcon className="size-4 transition-transform group-hover:rotate-12" />
-            Generate video
-          </>
+      <div className="space-y-3">
+        {/* Blocked before the request, not after: the renderer burns text into
+            pixels, so an unreadable palette cannot be fixed downstream. */}
+        {paletteBlocks && (
+          <p
+            id="submit-blocked"
+            className="flex items-start gap-2 rounded-xl border border-red-400/25 bg-red-500/[0.07] p-3 text-xs leading-relaxed text-red-200/90"
+          >
+            <AlertTriangleIcon className="mt-px size-3.5 shrink-0" />
+            <span>
+              Your custom palette is below WCAG AA on{' '}
+              {report.failures.length === 1 ? 'one pair' : `${report.failures.length} pairs`}
+              {report.failures.length > 0 && (
+                <>
+                  {' '}
+                  (
+                  {report.failures.map((check, index) => (
+                    <span key={check.rule.id}>
+                      {index > 0 && ', '}
+                      <span className="font-medium">{check.rule.label}</span> {check.display}:1
+                      {' vs '}
+                      {check.rule.min.toFixed(1)}:1
+                    </span>
+                  ))}
+                  )
+                </>
+              )}
+              . Adjust the colours or use <span className="font-medium">Fix contrast</span> above
+              to continue.
+            </span>
+          </p>
         )}
-      </Button>
 
-      <p className="flex items-center justify-center gap-1.5 text-center text-xs text-white/25">
-        <SparklesIcon className="size-3" />
-        Script, images, narration and music are generated for you.
-      </p>
+        <Button
+          type="submit"
+          size="lg"
+          disabled={isSubmitting || paletteBlocks}
+          aria-describedby={paletteBlocks ? 'submit-blocked' : undefined}
+          className="group relative w-full overflow-hidden bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-lg shadow-violet-950/40 transition-all hover:from-violet-500 hover:to-indigo-500 hover:shadow-violet-900/50 disabled:opacity-60"
+        >
+          {isSubmitting ? (
+            <>
+              <Loader2Icon className="size-4 animate-spin" />
+              Starting your video…
+            </>
+          ) : (
+            <>
+              <WandSparklesIcon className="size-4 transition-transform group-hover:rotate-12" />
+              Generate video
+            </>
+          )}
+        </Button>
+
+        <p className="flex items-center justify-center gap-1.5 text-center text-xs text-white/25">
+          <SparklesIcon className="size-3" />
+          Script, headings, timed bullets, narration and music are generated for you.
+        </p>
+      </div>
     </form>
   )
 }

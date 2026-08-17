@@ -26,12 +26,19 @@ that runs long gets abruptly cut by the video mux.
 
 from __future__ import annotations
 
+import logging
 import tempfile
+import time
 from pathlib import Path
 
 from app.core.config import get_settings
-from app.providers._gemini import generate_content, inline_data_from
+from app.providers._gemini import GeminiError, generate_content, inline_data_from
 from app.providers._media import MediaError, audio_duration, run_ffmpeg
+
+logger = logging.getLogger(__name__)
+
+EMPTY_PART_ATTEMPTS = 3
+"""Retries when the model returns a 200 with no audio part."""
 
 # Seam length for the loop crossfade. Long enough to hide the join, short enough that a
 # 30s clip does not lose an audible chunk of its structure per repeat.
@@ -94,9 +101,34 @@ class LyriaMusicProvider:
         out_path = Path(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        body = {"contents": [{"parts": [{"text": _compose_prompt(mood)}]}]}
-        response = generate_content(self.model, body, self.api_key, timeout=self.timeout)
-        mime, data = inline_data_from(response)
+        # A 200 can still return a candidate with no parts (observed:
+        # finishReason='OTHER'). That is a generation-side hiccup, not a client error,
+        # so it deserves the same retry treatment as a 503 — which generate_content's
+        # status-code retry does not cover. Vary the prompt slightly each attempt so a
+        # deterministic refusal on one phrasing doesn't repeat forever.
+        last_error: Exception | None = None
+        for attempt in range(1, EMPTY_PART_ATTEMPTS + 1):
+            body = {"contents": [{"parts": [{"text": _compose_prompt(mood, attempt=attempt)}]}]}
+            try:
+                response = generate_content(self.model, body, self.api_key, timeout=self.timeout)
+                mime, data = inline_data_from(response)
+                break
+            except GeminiError as exc:
+                last_error = exc
+                if "no parts" not in str(exc) and "no candidates" not in str(exc):
+                    raise
+                logger.warning(
+                    "%s returned an empty candidate (attempt %d/%d): %s",
+                    self.model,
+                    attempt,
+                    EMPTY_PART_ATTEMPTS,
+                    exc,
+                )
+                time.sleep(1.5 * attempt)
+        else:
+            raise MusicError(
+                f"{self.model} returned no audio after {EMPTY_PART_ATTEMPTS} attempts"
+            ) from last_error
 
         suffix = _MIME_EXTENSIONS.get(mime.lower(), ".mp3")
         with tempfile.TemporaryDirectory(prefix="lyria-") as tmp:
@@ -119,8 +151,18 @@ class LyriaMusicProvider:
 # --------------------------------------------------------------------------- helpers
 
 
-def _compose_prompt(mood: str) -> str:
+def _compose_prompt(mood: str, *, attempt: int = 1) -> str:
+    """Build the prompt. Later attempts are progressively plainer.
+
+    An empty candidate is sometimes reproducible for a given phrasing, so retrying the
+    identical string can fail identically. Falling back toward a generic request gives
+    the retry a real chance of differing.
+    """
     mood = (mood or "").strip().rstrip(".") or DEFAULT_MOOD
+    if attempt >= 3:
+        return DEFAULT_MOOD
+    if attempt == 2:
+        return f"{DEFAULT_MOOD}. {STYLE_SUFFIX}"
     return f"{mood}. {STYLE_SUFFIX}"
 
 

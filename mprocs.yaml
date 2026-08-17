@@ -26,7 +26,10 @@ procs:
     autostart: false
 
   lint:
-    shell: "uv run ruff check app/ && pnpm --dir ../frontend exec tsc --noEmit"
+    # `pnpm typecheck` runs `tsc -b`, NOT `tsc --noEmit`. The frontend tsconfig is a
+    # solution file (`files: []` + references), so `--noEmit` compiles an empty program
+    # and exits 0 even on a blatant type error — verified. Never use it as a gate.
+    shell: "uv run ruff check app/ && pnpm --dir ../frontend typecheck"
     cwd: "backend"
     autostart: false
 

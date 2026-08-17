@@ -60,11 +60,17 @@ def set_engine(engine: Engine | None) -> None:
 
 
 def init_db() -> None:
-    """Create tables. Idempotent — safe on every startup."""
+    """Create tables, then add any columns an older DB is missing. Idempotent.
+
+    ``create_all`` creates missing *tables* only — it never alters one that already
+    exists. A dev database from a previous release therefore needs the additive column
+    migration in ``app.db.models``, or every INSERT fails on the new columns.
+    """
     # Import for side effect: registers Job on SQLModel.metadata before create_all.
-    from app.db import models  # noqa: F401
+    from app.db import models
 
     SQLModel.metadata.create_all(get_engine())
+    models.migrate(get_engine())
 
 
 def get_session() -> Iterator[Session]:
