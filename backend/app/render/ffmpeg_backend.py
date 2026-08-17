@@ -14,7 +14,7 @@ Four things in here are load-bearing and easy to get wrong:
 *zoompan jitter.* ``zoompan`` truncates its ``x``/``y`` expressions to integers, so a
 slow pan advances 0px for several frames and then jumps 1px — a visible stutter. The
 cure has two halves, and each fixes a different cause; see
-:func:`upscale_factors` and :func:`eased_progress`.
+:func:`motion_canvas` and :func:`eased_progress`.
 
 *Generated clips.* A scene's visual may be a Veo clip rather than a still
 (``Scene.video_path``). It is fitted into the same region, converted to the timeline's
@@ -85,7 +85,7 @@ MIN_PAN_ZOOM = 1.06
 #    raises U. The factor was a fixed 4, calibrated when zoompan filled the frame
 #    (1920 wide); Ken Burns now runs inside the image region (``hero_right`` is 856x816),
 #    so a 4x canvas is 3424 wide instead of 7680 and the same move has less than half the
-#    headroom it was tuned for. :func:`upscale_factors` derives U from the region, the
+#    headroom it was tuned for. :func:`motion_canvas` derives the canvas from the region, the
 #    distance the move actually travels and the frame count instead.
 #
 # 2. *Easing.* ``ease_in_out`` was a pure smoothstep, whose velocity is **exactly zero**
@@ -94,16 +94,29 @@ MIN_PAN_ZOOM = 1.06
 #    but blends in enough linear ramp to guarantee a velocity floor. This is free, and on
 #    the measured cases it is the larger of the two effects.
 
-EASE_VELOCITY_FLOOR = 0.15
+EASE_VELOCITY_FLOOR = 0.20
 """Fraction of the mean rate that an ``ease_in_out`` move still travels at its slowest.
 
 0 is a pure smoothstep and is what shipped: velocity ``3u^2-2u^3`` differentiates to
 ``6u(1-u)``, which is zero at both endpoints, so the first and last frames of every move
-held position no matter how much headroom zoompan was given. Blending in a linear ramp
-puts a floor under it. 0.15 keeps 85% of the smoothstep's character — a viewer cannot
-distinguish "starts at 15% speed" from "starts at 0% speed", but the artefact can:
-measured on ``hero_right``/``pan_right`` at 1080p over 604 frames, the duplicate-frame
-ratio in the evaluator's window fell from 11.67% to 2.50% from this change alone.
+held position no matter how much headroom zoompan was given. Blending in a linear ramp puts
+a floor under it, and this is the single largest effect in the whole fix — it costs nothing.
+
+0.20 is measured, not guessed. Sweeping it over the seven real layout/motion pairs, with
+everything else held at its final value:
+
+    floor   hero pan   hero zoom   hero zoom_out   bleed pan   bleed zoom
+    0.00     51.67%      31.67%        27.50%        30.83%       9.17%
+    0.15      7.50%      15.00%        11.67%         3.33%      10.00%
+    0.20      4.17%      13.33%        10.83%         1.67%       6.67%
+    0.25      4.17%      12.50%        10.83%         0.00%       4.17%
+
+0.15 left two pairs above the evaluator's 12% noise floor; 0.20 leaves one, and it is the
+pathological one (a 43px zoom spread over 20 seconds — see the module report). 0.25 buys
+0.8% on that single case and flattens the ease further for nothing else, so it is not worth
+it. At 0.20 the move's fastest frame is still 7x its slowest, which reads unmistakably as
+an ease; a viewer cannot tell "starts at 20% speed" from "starts at 0% speed", but
+``mpdecimate`` can, and so can the eye that was seeing the stutter.
 """
 
 CANVAS_STEP_TARGET = 1.0
@@ -143,19 +156,24 @@ and :func:`slowest_step` is the number to argue with.
 UPSCALE_BUDGET_BASIS = 4
 """The ``upscale_factor`` that :data:`CANVAS_PIXEL_BUDGET` was measured at."""
 
-MIN_TRAVEL_UPSCALE = 2
-"""Never run zoompan at canvas == region: a fast move needs little headroom, but zero
-headroom quantises it to whole output pixels for no saving worth having."""
-
-PAN_CROSS_UPSCALE = 2
-"""Cross-axis oversampling for a pan. A pan holds a fixed zoom, so the crop's size and
-its cross-axis offset never change and the axis needs resolution only for *detail*, not
-for positional precision. 2x supersampling of the output is ample."""
-
 ZOOM_CROSS_UPSCALE = 4
-"""Cross-axis oversampling for a zoom, which moves both axes and changes the crop's size.
-Measured: dropping a zoom's cross axis to 2 costs about half the gain (23.3% vs 15.8%),
-while raising it past 4 buys nothing (identical ratio at twice the render time)."""
+"""Cross-axis oversampling for a zoom, which moves *both* axes and changes the crop's size.
+
+A pan gets no such constant: it holds a fixed zoom, so the crop's size and its cross-axis
+offset are the same integers on every frame and that axis needs resolution only for
+*detail*. Its cross factor is therefore exactly :func:`detail_upscale` and not a pixel more.
+That is worth stating because spending anything there is spending it twice over — the area
+budget is shared, so two wasted cross-axis pixels halve the travel-axis precision that
+actually removes the artefact. Measured on ``full_bleed``/``pan_left``, where the source
+cannot fill 1080p so detail is 1: a cross factor of 2 gave a 9600x2160 canvas and 19.17%
+duplicates, while dropping it to detail gave 21120x1080 — the same 23M pixels, spent on the
+axis that moves — and **3.33%**.
+
+A zoom cannot do that. Its binding constraint is whichever canvas axis steps *last*, so
+starving one axis stalls the whole frame however fine the other is: at a cross factor of 2 a
+35280x1800 canvas still measured 25.83%, worse than a 6480x3600 one at 15.00%. 4 is the
+measured knee — past it the ratio stops improving and the time keeps rising.
+"""
 
 MAX_DETAIL_UPSCALE = 4
 MAX_SOURCE_UPSCALE = 1.25
@@ -433,62 +451,106 @@ def detail_upscale(src_size: tuple[int, int], region: Region) -> int:
     return max(1, min(MAX_DETAIL_UPSCALE, int(MAX_SOURCE_UPSCALE / cover)))
 
 
-def upscale_factors(
+def plan_zoom_ceiling(plan: VisualPlan) -> float:
+    """The largest zoom the move reaches — the factor zoompan's crop is divided by."""
+    if plan.motion in (Motion.PAN_LEFT, Motion.PAN_RIGHT):
+        return max(plan.zoom_from, MIN_PAN_ZOOM)
+    if plan.motion in (Motion.ZOOM_IN, Motion.ZOOM_OUT):
+        return max(plan.zoom_from, plan.zoom_to, 1.0)
+    return 1.0
+
+
+@dataclass(frozen=True)
+class MotionCanvas:
+    """What zoompan reads, and what was lanczos-fitted to get there."""
+
+    fit: tuple[int, int]
+    """Isotropic cover-and-crop target: ``region * detail``. Where lanczos runs."""
+
+    canvas: tuple[int, int]
+    """What zoompan actually reads — ``fit`` after a cheap anamorphic stretch."""
+
+    detail: int
+
+    @property
+    def stretched(self) -> bool:
+        return self.canvas != self.fit
+
+
+def motion_canvas(
     plan: VisualPlan,
     region: Region,
     frames: int,
     profile: RenderProfile,
     src_size: tuple[int, int] = (0, 0),
-) -> tuple[int, int, int]:
-    """``(horizontal, vertical, detail)`` canvas oversampling for zoompan.
+) -> MotionCanvas:
+    """Size zoompan's canvas for this move.
 
-    ``detail`` is the isotropic factor the source is lanczos-fitted to; ``horizontal`` and
-    ``vertical`` are the canvas the result is then *stretched* to. Splitting the two is the
-    whole trick, because they solve different problems:
+    Three requirements, and they pull in different directions:
 
-    * detail needs real pixels, and the source runs out of them (:func:`detail_upscale`);
-    * positional precision needs a fine integer *grid* to land on, not more information,
-      so a cheap bilinear stretch buys it.
+    1. **No resolution loss.** zoompan crops ``canvas/zoom`` and scales it to the region, so
+       ``canvas >= region * zoom`` on *both* axes or the crop is an upscale and the panel is
+       measurably softer than the still it came from. This is the one an earlier draft of
+       this function got wrong: it worked in integer multiples of the region, so the only
+       values available were 1x (which upscales, because ``zoom > 1``) and 2x (which costs
+       twice the area). Sizing the canvas in *pixels* instead makes 1.08x reachable.
+    2. **Positional precision.** ``canvas/region`` on the travel axis is how many sub-steps
+       zoompan's integer x/y gets per output pixel; :data:`CANVAS_STEP_TARGET` says how many
+       it needs.
+    3. **Cost.** Area, not factor — see :data:`CANVAS_PIXEL_BUDGET`.
 
-    And the stretch does not have to be isotropic. zoompan crops proportionally to its
-    input and scales to the region, so an anamorphic canvas is exactly un-squeezed on the
-    way out (net scale is ``zoom`` on both axes regardless of the factors). A pan only
-    travels horizontally, so only that axis needs the fine grid — which is what makes the
-    honest fix affordable. Measured on ``hero_right``/``pan_right``, 604 frames, 1080p:
+    So: the cross axis takes the least it can get away with (1, plus the zoom, plus whatever
+    detail the source justified) and the travel axis spends everything left over.
 
-        canvas                     duplicate ratio   render (4s window)
-        3424x3264   (old, 4x4)          46.67%            7.74s
-        13696x13056 (isotropic 16x)     13.33%           64.04s
-        13696x1632  (anamorphic)        11.67%            7.57s
+    Nothing is distorted by this, whatever the numbers. The still is cover-fitted to the
+    region's aspect first, so its net scale through the stretch and back out of zoompan is
+    ``region * zoom / fit`` on each axis — and ``fit`` has the region's aspect, so the two
+    are equal by construction.
 
-    Same smoothness as the isotropic 16x canvas for an eighth of the time, and no more
-    expensive than the 4x canvas it replaces.
+    Measured on ``hero_right``/``pan_right`` at 1080p over 604 frames, in the evaluator's
+    own 4s window:
+
+        canvas                       duplicate ratio   render
+        2880x3600   (old, fixed 4x4)      51.67%        5.70s
+        11520x14400 (isotropic 16x)       ~13%          ~64s
+        13332x1800  (this)                 4.17%        9.02s
+
+    The isotropic canvas that reaches the same smoothness is seven times the pixels and
+    seven times the time. And because the budget is an *area*, the derivation makes
+    ``full_bleed`` **cheaper** than the fixed 4x it replaces (24 vs 33 Mpixels) while taking
+    it from 30.83% duplicates to under 2%.
     """
+    region_size = (region.width, region.height)
     if plan.motion is Motion.STATIC or frames <= 1:
-        return 1, 1, 1
+        return MotionCanvas(fit=region_size, canvas=region_size, detail=1)
 
     detail = detail_upscale(src_size, region)
+    fit = (region.width * detail, region.height * detail)
+    zoom = plan_zoom_ceiling(plan)
 
-    # The cross axis is fixed by what the motion does to it, and never below the detail
-    # the lanczos fit already produced (the stretch must not downscale).
-    cross = (
-        ZOOM_CROSS_UPSCALE
-        if plan.motion in (Motion.ZOOM_IN, Motion.ZOOM_OUT)
-        else PAN_CROSS_UPSCALE
-    )
-    vertical = max(detail, cross)
+    # (1) Never let zoompan's own crop become an upscale, on either axis.
+    floor_w = _even(region.width * zoom, minimum=2)
+    floor_h = _even(region.height * zoom, minimum=2)
 
-    # Spend the remaining area budget on the travel axis.
+    # The cross axis takes the minimum it can. A pan does not move it, so "the minimum" is
+    # all it will ever need; a zoom does move it, so it also buys precision there.
+    zooming = plan.motion in (Motion.ZOOM_IN, Motion.ZOOM_OUT)
+    canvas_h = max(fit[1], floor_h)
+    if zooming:
+        canvas_h = max(canvas_h, _even(region.height * ZOOM_CROSS_UPSCALE, minimum=2))
+
+    # (3) Whatever area is left goes to the travel axis...
     budget = CANVAS_PIXEL_BUDGET * max(1, profile.upscale_factor) / UPSCALE_BUDGET_BASIS
-    per_step = max(1.0, region.width * region.height * vertical)
-    affordable = int(budget // per_step)
+    affordable = _even(budget / max(1, canvas_h), minimum=2)
 
+    # ...up to (2) what the slowest frame of the move actually needs.
     step = slowest_step(plan, region, frames)
-    # step == 0 means the move does not move; ask for everything and let the budget decide.
-    wanted = affordable if step <= 0.0 else math.ceil(CANVAS_STEP_TARGET / step)
+    wanted = affordable if step <= 0.0 else _even(
+        region.width * CANVAS_STEP_TARGET / step, minimum=2
+    )
 
-    horizontal = max(MIN_TRAVEL_UPSCALE, detail, min(wanted, affordable))
-    return horizontal, vertical, detail
+    canvas_w = max(fit[0], floor_w, min(wanted, affordable))
+    return MotionCanvas(fit=fit, canvas=(canvas_w, canvas_h), detail=detail)
 
 
 def clip_seam(clip_duration: float) -> float:
@@ -973,31 +1035,29 @@ class FFmpegBackend:
         """Fit, animate and round the image *inside its region*, ending in ``[hero]``.
 
         The pre-upscale is relative to the **region**, not the frame, and is derived rather
-        than fixed — see :func:`upscale_factors` for why, and for why the canvas it asks
+        than fixed — see :func:`motion_canvas` for why, and for why the canvas it asks
         for is usually anamorphic.
         """
         static = plan.motion is Motion.STATIC
-        horizontal, vertical, detail = upscale_factors(
-            plan, region, frames, profile, src_size=src_size
-        )
-        fit = (region.width * detail, region.height * detail)
+        sizing = motion_canvas(plan, region, frames, profile, src_size=src_size)
 
         parts = self._fit_chain(
             src_size,
             (region.width, region.height),
-            fit,
+            sizing.fit,
             blur_fill=plan.layout is SlideLayout.FULL_BLEED,
         )
 
         if static:
             parts.append("[fit]null[moved]")
         else:
-            canvas = (region.width * horizontal, region.height * vertical)
-            if canvas != fit:
+            if sizing.stretched:
                 # Bilinear on purpose: this stretch adds no information, only a finer
                 # integer grid for zoompan's x/y to land on, and lanczos here would cost
                 # real time to ring a canvas that is about to be resampled back down.
-                parts.append(f"[fit]scale={canvas[0]}:{canvas[1]}:flags=bilinear[canvas]")
+                parts.append(
+                    f"[fit]scale={sizing.canvas[0]}:{sizing.canvas[1]}:flags=bilinear[canvas]"
+                )
                 source = "canvas"
             else:
                 source = "fit"
@@ -1008,12 +1068,16 @@ class FFmpegBackend:
                 f":d={frames}:fps={profile.fps}:s={region.width}x{region.height}[moved]"
             )
             logger.debug(
-                "ken burns %s/%s: region %dx%d, travel %.1fpx over %d frames, "
-                "canvas %dx%d (h=%d v=%d detail=%d), slowest %.4fpx/frame, peak %.3fpx/frame",
+                "ken burns %s/%s: region %dx%d, travel %.1fpx over %d frames, fit %dx%d "
+                "(detail %dx), canvas %dx%d (%.1f Mpx), slowest %.4fpx/frame, "
+                "canvas step %.2fpx/frame, peak %.3fpx/frame",
                 plan.layout.value, plan.motion.value, region.width, region.height,
-                motion_travel(plan, region), frames, region.width * horizontal,
-                region.height * vertical, horizontal, vertical, detail,
-                slowest_step(plan, region, frames), peak_step(plan, region, frames),
+                motion_travel(plan, region), frames, sizing.fit[0], sizing.fit[1],
+                sizing.detail, sizing.canvas[0], sizing.canvas[1],
+                sizing.canvas[0] * sizing.canvas[1] / 1e6,
+                slowest_step(plan, region, frames),
+                slowest_step(plan, region, frames) * sizing.canvas[0] / max(1, region.width),
+                peak_step(plan, region, frames),
             )
 
         return parts + self._corner_chain(plan, region, profile)

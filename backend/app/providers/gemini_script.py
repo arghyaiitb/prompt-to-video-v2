@@ -168,42 +168,74 @@ ROLE_NARRATION_WORDS: dict[SceneRole, tuple[int, int, int]] = {
     SceneRole.CLOSING: (13, 17, 20),
 }
 
-# Words per minute MEASURED on live TTS, one voice per language, over eight paragraphs of
-# real training narration written natively in each language and saying the SAME EIGHT
-# THINGS — parallel content is what makes the three numbers comparable at all.
+# Effective words per minute per language — `docs/LANGUAGES.md` §6.2, which is the authority
+# on every number in this block. English stays at DIRECTION §5's 135.
 #
-#   en  114.3 wpm (97.7-136.0, sd 15.1)  Deepgram aura-2-draco-en
-#   es  161.5 wpm (127.9-190.6, sd 19.6) Deepgram aura-2-carina-es
-#   hi  183.7 wpm (165.1-200.2, sd 12.1) Polly Kajal, LanguageCode=hi-IN, neural
-#
-# Measured here rather than read off `docs/LANGUAGES.md`, which did not exist when this was
-# written; if it lands later, ITS budgets win over these and this table is what to replace.
-#
-# The English figure is deliberately NOT used to overrule `WORDS_PER_MINUTE`. DIRECTION §5
-# is the authority on the English pace and the committed budgets are built on 135; that the
-# draco voice averages 114 wpm and swings 39% across eight paragraphs is the §5 defect
-# itself, and re-tuning English is not this change. Only the RATIOS are used below, and a
-# ratio cancels whatever pacing bias the measurement carries.
-MEASURED_WPM: dict[Language, float] = {
-    Language.EN: 114.3,
-    Language.ES: 161.5,
-    Language.HI: 183.7,
+# These are NOT independent measurements of "how fast is Spanish". LANGUAGES.md §6.3 is
+# emphatic that the dominant variable is not the language at all: measured words-per-second
+# ranged 2.40-3.80 across its experiments, a 58% spread, "driven almost entirely by how many
+# sentence-final pauses the model wrote". A first pass at this file measured en at 114 wpm and
+# hi at 184 wpm and derived factors of 1.41/1.61 from them — numbers that were really
+# measuring sentence length, because each language's sample had a different sentence count.
+# §6.2 holds sentence count and structure FIXED across the three translations, so only its
+# RATIOS are trustworthy, and they are far smaller: es 1.04, hi 1.15.
+LANGUAGE_WPM: dict[Language, float] = {
+    Language.EN: WORDS_PER_MINUTE,  # 135, DIRECTION §5
+    Language.ES: 140.0,
+    Language.HI: 155.0,
 }
 
-# Multiplier on every English word budget, per language. Derived, not hand-set: one number
-# per language, so a budget table cannot drift away from the rate it was justified by.
-#
-# It is a rate ratio because the budget is a DURATION, not a word count. The direction is
-# the opposite of the intuition: Spanish and Hindi need MORE words to say the same thing
-# (1.14x and 1.32x here), but their voices speak proportionally FASTER still, so re-using
-# the English budget makes the scene too SHORT rather than too long. A ten-word English
-# title card is 4.4s at 135 wpm but only 3.7s of Spanish — under the 4.0s floor of
-# `SceneRole.TITLE.target_duration`. Scaling by the rate ratio holds the duration fixed,
-# which is the thing the role window actually constrains.
+# Words-per-second ratio to English, `docs/LANGUAGES.md` §6.2. Kept for provenance and for
+# callers that want to explain a budget; the budgets themselves are the explicit table below.
 LANGUAGE_WORD_FACTOR: dict[Language, float] = {
-    language: round(wpm / MEASURED_WPM[Language.EN], 2) for language, wpm in MEASURED_WPM.items()
+    Language.EN: 1.0,
+    Language.ES: 1.04,
+    Language.HI: 1.15,
 }
-"""en 1.0, es 1.41, hi 1.61. Rounded to 2dp so the budgets are stable and quotable."""
+
+# (min, target, max) narration words per role PER LANGUAGE — `docs/LANGUAGES.md` §6.2,
+# transcribed rather than recomputed from `LANGUAGE_WORD_FACTOR`. Deliberately: the doc's
+# table is the authority, and multiplying-then-rounding does not reproduce it exactly (43 x
+# 1.15 = 49.45, which rounds to 49 where the doc says 50). Encoding the arithmetic instead of
+# the answer would silently disagree with the document this is supposed to implement.
+#
+# A budget is a DURATION, which is why it scales at all — and the scaling is much gentler than
+# the translation expansion. §6.3: Spanish needs 1.12x the words to say the same thing but
+# only gets 1.04x the budget, so a Spanish slide carries about 93% of the English slide's
+# information and a Hindi one about 90%. That is a real teaching-content loss with no lever on
+# it that does not break the duration clamps; the doc's advice is to accept it or add a scene.
+ROLE_NARRATION_WORDS_BY_LANGUAGE: dict[Language, dict[SceneRole, tuple[int, int, int]]] = {
+    Language.EN: ROLE_NARRATION_WORDS,
+    Language.ES: {
+        SceneRole.TITLE: (9, 10, 15),
+        SceneRole.CONTENT: (26, 35, 45),
+        SceneRole.SUMMARY: (21, 28, 32),
+        SceneRole.CLOSING: (14, 18, 21),
+    },
+    Language.HI: {
+        SceneRole.TITLE: (10, 12, 16),
+        SceneRole.CONTENT: (29, 39, 50),
+        SceneRole.SUMMARY: (23, 31, 36),
+        SceneRole.CLOSING: (15, 20, 23),
+    },
+}
+
+# Sentences per scene, by role. `docs/LANGUAGES.md` §6.3: "The prompt must constrain sentences
+# per scene, or the word budget means nothing" — the same 34-word budget produced 20.2-23.5s
+# of staccato English but 12.8-13.0s of Hindi, purely on sentence count. A word budget with no
+# sentence budget is not a duration.
+#
+# Applied to the NON-ENGLISH prompts only. Not timidity: §6.3 finds English is "the language
+# currently out of spec" (34-word content scenes running 20-23s against a 19.0s max), so
+# English needs this too — but that is a change to English pacing, which is DIRECTION §5's
+# territory and is measured by other tests and other agents. Adding it here would silently
+# retune English inside a language change. Flagged for whoever owns English pacing instead.
+ROLE_SENTENCES: dict[SceneRole, str] = {
+    SceneRole.TITLE: "exactly 1 sentence",
+    SceneRole.CONTENT: "3 sentences, not four short ones and not one long one",
+    SceneRole.SUMMARY: "2 or 3 sentences",
+    SceneRole.CLOSING: "2 sentences",
+}
 
 # Fewest scenes that earn a recap — `docs/DIRECTION.md` §1.1, which is explicit that a
 # six-slide video does not get one either: below ~100s there is nothing to recap, the

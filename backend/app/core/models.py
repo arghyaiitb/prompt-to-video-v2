@@ -440,6 +440,15 @@ class Timeline(BaseModel):
     theme: Theme = Field(default_factory=Theme)
     """Palette for this video. Persisted so a re-render reproduces the same branding."""
 
+    logo_path: str | None = None
+    """Brand mark for this video, overriding ``settings.video_logo_path``.
+
+    Persisted on the Timeline rather than read from config at render time so a re-render
+    reproduces the same branding even after the default or the upload store changes.
+    None means fall back to the configured default; the renderer skips branding entirely
+    if neither resolves.
+    """
+
     @property
     def narration_duration(self) -> float:
         return max((s.end for s in self.scenes), default=0.0)

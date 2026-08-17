@@ -34,9 +34,9 @@ from app.render import ffmpeg as ff
 from app.render.contracts import SceneText, TextLayer
 from app.render.ffmpeg_backend import (
     AUTO_LOGO,
+    CANVAS_PIXEL_BUDGET,
     CLIP_SEAM_CROSSFADE,
     EASE_VELOCITY_FLOOR,
-    MIN_TRAVEL_UPSCALE,
     STROBE_STEP_PIXELS,
     FFmpegBackend,
     clip_loop_count,
@@ -48,11 +48,12 @@ from app.render.ffmpeg_backend import (
     ffmpeg_colour,
     frames_for,
     layout_region,
+    motion_canvas,
     motion_travel,
     peak_step,
+    plan_zoom_ceiling,
     resolve_logo_source,
     slowest_step,
-    upscale_factors,
 )
 from app.render.planner import (
     BULLET_ANIMATION_ROTATION,
@@ -846,14 +847,14 @@ def test_the_upscale_is_derived_from_the_move_not_a_fixed_factor():
     sweep = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.PAN_RIGHT,
                        zoom_from=1.6, zoom_to=1.6)
 
-    slow_h, _, _ = upscale_factors(crawl, region, 600, profile, src_size=(2752, 1536))
-    fast_h, _, _ = upscale_factors(sweep, region, 600, profile, src_size=(2752, 1536))
+    slow = motion_canvas(crawl, region, 600, profile, src_size=(2752, 1536))
+    fast = motion_canvas(sweep, region, 600, profile, src_size=(2752, 1536))
 
-    assert slow_h > fast_h, "a slower move needs more headroom, not the same amount"
-    assert slow_h > 4, "4x is what was measured as insufficient for a slow hero pan"
+    assert slow.canvas[0] > fast.canvas[0], "a slower move needs more headroom"
+    assert slow.canvas[0] > region.width * 4, "4x was measured as insufficient here"
     # And the frame count matters just as much as the distance.
-    brief, _, _ = upscale_factors(crawl, region, 60, profile, src_size=(2752, 1536))
-    assert brief < slow_h, "the same move over fewer frames moves faster per frame"
+    brief = motion_canvas(crawl, region, 60, profile, src_size=(2752, 1536))
+    assert brief.canvas[0] < slow.canvas[0], "fewer frames means faster per frame"
 
 
 def test_ken_burns_happens_inside_the_image_region_not_across_the_frame():
@@ -874,13 +875,9 @@ def test_ken_burns_happens_inside_the_image_region_not_across_the_frame():
     assert f"overlay=x={region.x}:y={region.y}" in graph, "region must land at its offset"
     assert graph.startswith("color=c=0x0B1220:s=1920x1080"), "solid background first"
 
-    # Every canvas dimension is a whole multiple of the region's, so zoompan's crop is
-    # proportional to its input and the region's aspect survives.
-    horizontal, vertical, _ = upscale_factors(
-        plan, region, 90, profile, src_size=(2752, 1536)
-    )
-    assert f"{region.width * horizontal}:{region.height * vertical}" in graph
-    assert region.width * horizontal > region.width
+    sizing = motion_canvas(plan, region, 90, profile, src_size=(2752, 1536))
+    assert f"{sizing.canvas[0]}:{sizing.canvas[1]}" in graph
+    assert sizing.canvas[0] > region.width, "the canvas must exceed the region it feeds"
 
 
 def test_a_pans_canvas_is_anamorphic_because_only_one_axis_travels():
@@ -896,18 +893,20 @@ def test_a_pans_canvas_is_anamorphic_because_only_one_axis_travels():
     pan = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.PAN_RIGHT,
                      zoom_from=1.12, zoom_to=1.12)
 
-    horizontal, vertical, detail = upscale_factors(
-        pan, region, 604, profile, src_size=(2752, 1536)
+    sizing = motion_canvas(pan, region, 604, profile, src_size=(2752, 1536))
+    canvas_w, canvas_h = sizing.canvas
+    assert canvas_w / region.width > canvas_h / region.height, (
+        "a pan must not pay for cross-axis precision it cannot use"
     )
-    assert horizontal > vertical, "a pan must not pay for vertical precision it cannot use"
-    assert vertical >= detail, "the stretch may never downscale the lanczos fit"
+    assert sizing.stretched, "an anamorphic canvas is the point"
+    assert canvas_h >= sizing.fit[1], "the stretch may never downscale the lanczos fit"
 
     graph = _graph(FFmpegBackend(text_mode="scrim"), pan, profile,
                    src_size=(2752, 1536), frames=604)
     # The expensive lanczos fit happens at the small isotropic size...
-    assert f"scale={region.width * detail}:{region.height * detail}" in graph
+    assert f"scale={sizing.fit[0]}:{sizing.fit[1]}" in graph
     # ...and only a cheap bilinear stretch reaches the wide canvas.
-    stretch = f"scale={region.width * horizontal}:{region.height * vertical}:flags=bilinear"
+    stretch = f"scale={canvas_w}:{canvas_h}:flags=bilinear"
     assert stretch in graph, graph
     assert graph.index(stretch) < graph.index("zoompan")
 
@@ -920,9 +919,57 @@ def test_a_zoom_keeps_cross_axis_precision_because_it_moves_both_axes():
     zoom = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.ZOOM_IN,
                       zoom_from=1.0, zoom_to=1.12)
 
-    _, pan_v, _ = upscale_factors(pan, region, 604, profile, src_size=(2752, 1536))
-    _, zoom_v, _ = upscale_factors(zoom, region, 604, profile, src_size=(2752, 1536))
-    assert zoom_v > pan_v, "a zoom changes the crop's height every frame; a pan does not"
+    panned = motion_canvas(pan, region, 604, profile, src_size=(2752, 1536))
+    zoomed = motion_canvas(zoom, region, 604, profile, src_size=(2752, 1536))
+    assert zoomed.canvas[1] > panned.canvas[1], (
+        "a zoom changes the crop's height every frame; a pan does not"
+    )
+
+
+def test_zoompans_own_crop_is_never_an_upscale_of_the_fitted_still():
+    """The subtle resolution bug: canvas must be at least region * zoom on both axes.
+
+    zoompan crops ``canvas/zoom`` and scales that to the region. If the canvas only just
+    matches the region, the crop is *smaller* than the region and the last resample is an
+    upscale -- measurably softer than the still it came from. Measured: getting this wrong
+    on full_bleed cost 37% of the panel's horizontal gradient energy.
+    """
+    profile = RenderProfile(width=1920, height=1080, upscale_factor=4)
+    for layout in (SlideLayout.HERO_RIGHT, SlideLayout.IMAGE_BAND, SlideLayout.FULL_BLEED):
+        region = layout_region(VisualPlan(layout=layout), profile)
+        for motion, zf, zt in (
+            (Motion.PAN_RIGHT, 1.08, 1.08), (Motion.PAN_LEFT, 1.0, 1.0),
+            (Motion.ZOOM_IN, 1.0, 1.12), (Motion.ZOOM_OUT, 1.15, 1.0),
+        ):
+            plan = VisualPlan(layout=layout, motion=motion, zoom_from=zf, zoom_to=zt)
+            sizing = motion_canvas(plan, region, 600, profile, src_size=(2752, 1536))
+            zoom = plan_zoom_ceiling(plan)
+            assert sizing.canvas[0] / zoom >= region.width - 2, (
+                f"{layout}/{motion}: crop width {sizing.canvas[0] / zoom:.0f} upscales to "
+                f"{region.width}"
+            )
+            assert sizing.canvas[1] / zoom >= region.height - 2, (
+                f"{layout}/{motion}: crop height {sizing.canvas[1] / zoom:.0f} upscales to "
+                f"{region.height}"
+            )
+
+
+def test_the_canvas_stays_inside_its_area_budget():
+    """Cost is the canvas area resampled per frame, so that is what is budgeted."""
+    profile = RenderProfile(width=1920, height=1080, upscale_factor=4)
+    for layout in SlideLayout:
+        region = layout_region(VisualPlan(layout=layout), profile)
+        if region is None:
+            continue
+        for motion in (Motion.PAN_RIGHT, Motion.ZOOM_IN, Motion.ZOOM_OUT):
+            plan = VisualPlan(layout=layout, motion=motion, zoom_from=1.0, zoom_to=1.12)
+            sizing = motion_canvas(plan, region, 600, profile, src_size=(2752, 1536))
+            area = sizing.canvas[0] * sizing.canvas[1]
+            # The floors (no-upscale, keep the fit) can exceed the budget; nothing else may.
+            floor = max(sizing.fit[0], region.width * 2) * max(sizing.fit[1], region.height * 2)
+            assert area <= max(CANVAS_PIXEL_BUDGET * 1.05, floor), (
+                f"{layout}/{motion}: {area / 1e6:.1f} Mpx"
+            )
 
 
 def test_the_detail_factor_never_invents_pixels_the_source_does_not_have():
@@ -940,27 +987,30 @@ def test_the_detail_factor_never_invents_pixels_the_source_does_not_have():
     assert detail_upscale((0, 0), hero) == 1, "an unprobeable source must not divide by zero"
 
 
-def test_the_upscale_budget_still_honours_the_profile():
-    """`upscale_factor` is now a cost cap rather than the factor. It must still bite."""
+def test_the_area_budget_still_honours_the_profile():
+    """`upscale_factor` is now a cost budget rather than the factor. It must still bite."""
     region = layout_region(VisualPlan(layout=SlideLayout.HERO_RIGHT), HD)
     crawl = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.PAN_RIGHT,
                        zoom_from=1.06, zoom_to=1.06)
-    generous, _, _ = upscale_factors(
+    generous = motion_canvas(
         crawl, region, 600, RenderProfile(upscale_factor=4), src_size=(2752, 1536)
     )
-    thrifty, _, _ = upscale_factors(
+    thrifty = motion_canvas(
         crawl, region, 600, RenderProfile(upscale_factor=1), src_size=(2752, 1536)
     )
-    assert thrifty < generous, "a draft profile must be allowed to buy less smoothness"
-    assert thrifty >= MIN_TRAVEL_UPSCALE, "but never zero headroom"
+    assert thrifty.canvas[0] < generous.canvas[0], "a draft profile buys less smoothness"
+    assert thrifty.canvas[0] >= region.width, "but never less than the region it feeds"
 
 
 def test_a_static_shot_asks_for_no_canvas_at_all():
     region = layout_region(VisualPlan(layout=SlideLayout.HERO_RIGHT), HD)
     plan = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.STATIC)
-    assert upscale_factors(plan, region, 600, HD, src_size=(2752, 1536)) == (1, 1, 1)
+    sizing = motion_canvas(plan, region, 600, HD, src_size=(2752, 1536))
+    assert sizing.canvas == (region.width, region.height)
+    assert not sizing.stretched
     assert motion_travel(plan, region) == 0.0
     assert slowest_step(plan, region, 600) == 0.0
+    assert plan_zoom_ceiling(plan) == 1.0
 
 
 def test_static_motion_skips_zoompan_entirely():

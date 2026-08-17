@@ -70,6 +70,20 @@ class Settings(BaseSettings):
     video_default_image_model: str = "gemini-3.1-flash-image"
     video_default_music_model: str = "lyria-3-clip-preview"
     video_music_duck_db: int = -18
+    video_logo_max_bytes: int = 4 * 1024 * 1024
+    """Upload ceiling. Generous for a logo, small enough to bound decode cost."""
+
+    video_logo_max_dimension: int = 4096
+    """Reject larger sources: a small file can decode to an enormous bitmap, and the
+    renderer only ever needs ~120px of logo height."""
+
+    @property
+    def logo_dir(self) -> Path:
+        """Where uploaded brand marks live. Outside `out/` so job cleanup can't wipe them."""
+        d = self.video_cache_dir / "logos"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
     video_logo_path: Path | None = None
     """Branding watermark, composited bottom-left for the whole video.
 
