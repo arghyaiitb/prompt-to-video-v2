@@ -198,8 +198,15 @@ def _shape_polly(entry: Any) -> dict[str, Any] | None:
 
 
 def _polly_fallback(tier: str) -> list[dict[str, Any]]:
-    """Measured en-US voices supporting `tier`, default voice first."""
+    """Measured en-US voices supporting `tier`, default voice first.
+
+    A tier nobody declares support for (`auto`, or a typo in `VIDEO_POLLY_ENGINE`) must
+    not filter the list down to nothing — an empty picker is a worse failure than an
+    unfiltered one, and `PollySynthesizer` picks the best tier per voice for `auto`.
+    """
     default = get_settings().video_default_polly_voice
+    known_tiers = {t for _, _, tiers in POLLY_VOICES for t in tiers}
+    wanted = tier if tier in known_tiers else None
     voices = [
         {
             "id": name,
@@ -209,7 +216,7 @@ def _polly_fallback(tier: str) -> list[dict[str, Any]]:
             "use_cases": [],
         }
         for name, gender, tiers in POLLY_VOICES
-        if tier in tiers
+        if wanted is None or wanted in tiers
     ]
     voices.sort(key=lambda v: (0 if v["id"] == default else 1, v["name"]))
     return voices

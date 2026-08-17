@@ -8,6 +8,7 @@ skipped when no usable ffmpeg is on the box.
 from __future__ import annotations
 
 import math
+import re
 import subprocess
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from app.core.models import (
     Motion,
     RenderProfile,
     Scene,
+    SceneRole,
     SlideLayout,
     TextAnimation,
     TextPosition,
@@ -32,12 +34,25 @@ from app.render import ffmpeg as ff
 from app.render.contracts import SceneText, TextLayer
 from app.render.ffmpeg_backend import (
     AUTO_LOGO,
+    CLIP_SEAM_CROSSFADE,
+    EASE_VELOCITY_FLOOR,
+    MIN_TRAVEL_UPSCALE,
+    STROBE_STEP_PIXELS,
     FFmpegBackend,
+    clip_loop_count,
+    clip_loop_span,
+    clip_seam,
+    detail_upscale,
+    eased_progress,
     fallback_region,
     ffmpeg_colour,
     frames_for,
     layout_region,
+    motion_travel,
+    peak_step,
     resolve_logo_source,
+    slowest_step,
+    upscale_factors,
 )
 from app.render.planner import (
     BULLET_ANIMATION_ROTATION,
@@ -46,6 +61,7 @@ from app.render.planner import (
     MIN_ANIM_DURATION,
     MIN_ZOOM_SPAN,
     MOTION_ROTATION,
+    TRANSITION_ROTATION,
     RuleBasedPlanner,
 )
 
@@ -102,33 +118,54 @@ def test_planner_satisfies_protocol():
     assert isinstance(FFmpegBackend(text_mode="scrim"), VideoBackend)
 
 
-# ========================================================== planner: variety
+# ================================================= planner: one video, one style
+#
+# These tests replace an older set that asserted the *opposite* — that no two consecutive
+# scenes shared a motion, a layout, a transition or an entrance. That variety is what the
+# viewer described as "all over the place"; `docs/DIRECTION.md` §0 is the argument, and the
+# rule is now "repetition is the design". The old rotations survive behind `hold_*=False`,
+# and the tests below pin both halves.
 
 
-def test_no_two_consecutive_scenes_share_a_motion():
+def test_every_scene_shares_one_camera_move():
     timeline = RuleBasedPlanner().plan(make_timeline([4.0] * 8))
+    motions = {scene.plan.motion for scene in timeline.scenes}
+    spans = {round(abs(s.plan.zoom_to - s.plan.zoom_from), 4) for s in timeline.scenes}
+
+    assert motions == {Motion.ZOOM_IN}, motions
+    assert spans == {0.06}, f"one zoom amount for the video: {spans}"
+    assert {s.plan.easing for s in timeline.scenes} == {"linear"}
+
+
+def test_the_scripts_preferred_move_is_honoured_once_for_the_whole_video():
+    """The LLM still gets a vote — on the video, which is the level a house style is set at."""
+    requested = [Motion.PAN_RIGHT] * 4 + [Motion.ZOOM_OUT]
+    timeline = RuleBasedPlanner().plan(make_timeline([4.0] * 5, requested))
+    assert {s.plan.motion for s in timeline.scenes} == {Motion.PAN_RIGHT}
+
+
+def test_a_static_request_never_becomes_a_video_of_dead_stills():
+    timeline = RuleBasedPlanner().plan(make_timeline([4.0] * 3, [Motion.STATIC] * 3))
+    assert {s.plan.motion for s in timeline.scenes} == {Motion.ZOOM_IN}
+
+
+def test_the_old_per_scene_rotation_is_still_available():
+    timeline = RuleBasedPlanner(hold_motion=False).plan(make_timeline([4.0] * 8))
     motions = [scene.plan.motion for scene in timeline.scenes]
-    assert all(a != b for a, b in zip(motions, motions[1:], strict=False)), motions
-
-
-def test_repeated_llm_motion_is_rotated_away():
-    # The LLM picked ZOOM_IN for every scene; the planner must break the repetition.
-    timeline = RuleBasedPlanner().plan(make_timeline([4.0] * 5, [Motion.ZOOM_IN] * 5))
-    motions = [scene.plan.motion for scene in timeline.scenes]
-
-    assert motions[0] is Motion.ZOOM_IN, "the first request should be respected"
     assert all(a != b for a, b in zip(motions, motions[1:], strict=False)), motions
     assert all(m in MOTION_ROTATION for m in motions)
 
 
 def test_llm_motion_is_respected_when_it_does_not_repeat():
     requested = [Motion.PAN_LEFT, Motion.ZOOM_OUT, Motion.STATIC, Motion.PAN_RIGHT]
-    timeline = RuleBasedPlanner().plan(make_timeline([4.0] * 4, requested))
+    timeline = RuleBasedPlanner(hold_motion=False).plan(make_timeline([4.0] * 4, requested))
     assert [scene.plan.motion for scene in timeline.scenes] == requested
 
 
 def test_repeated_static_rotates_to_a_moving_shot():
-    timeline = RuleBasedPlanner().plan(make_timeline([4.0, 4.0], [Motion.STATIC] * 2))
+    timeline = RuleBasedPlanner(hold_motion=False).plan(
+        make_timeline([4.0, 4.0], [Motion.STATIC] * 2)
+    )
     assert timeline.scenes[0].plan.motion is Motion.STATIC
     assert timeline.scenes[1].plan.motion is not Motion.STATIC
 
@@ -159,44 +196,43 @@ def test_pans_hold_enough_zoom_to_have_somewhere_to_travel():
 # ======================================================= planner: transitions
 
 
-def test_first_scene_fades_up_from_black_then_transitions_alternate():
+def test_every_boundary_including_the_first_is_the_same_crossfade():
     timeline = RuleBasedPlanner().plan(make_timeline([4.0] * 7))
     transitions = [scene.plan.transition_in for scene in timeline.scenes]
-    assert transitions[0] is Transition.FADE
-    assert transitions[1:] == [
-        Transition.FADE,
-        Transition.SLIDE_LEFT,
-        Transition.WIPE_RIGHT,
-        Transition.FADE,
-        Transition.SLIDE_LEFT,
-        Transition.WIPE_RIGHT,
-    ]
-    assert all(a != b for a, b in zip(transitions[1:], transitions[2:], strict=False))
+    assert transitions == [Transition.FADE] * 7
+    # ...and the old rotation is still reachable, for a deck that is not burned-in text.
+    rotated = RuleBasedPlanner(hold_transition=False).plan(make_timeline([4.0] * 7))
+    assert all(s.plan.transition_in in TRANSITION_ROTATION for s in rotated.scenes)
 
 
-def test_dissolve_is_never_chosen_because_this_build_dithers_it():
-    """Measured defect: xfade=dissolve on this ffmpeg is a noise dissolve, not a blend.
+def test_only_a_crossfade_is_ever_used_because_wipes_shred_burned_in_text():
+    """``slideleft`` and ``wiperight`` are gone, and this is not a taste question.
 
-    Mid-transition frames come out visibly grainy. FADE is the smooth crossfade, so
-    the rotation uses that instead. The enum member stays for deserialising old plans.
+    The text is burned into the scene clip, so a wipe cuts through both stacks at once —
+    a measured frame of the rejected render has two headings and eight bullet fragments on
+    screen ("ize / re Tactics", "e Artificial Panic"). ``dissolve`` stays out too: on this
+    ffmpeg build it is a dither, not a blend.
     """
     timeline = RuleBasedPlanner().plan(make_timeline([4.0] * 12))
     chosen = {scene.plan.transition_in for scene in timeline.scenes}
-    assert Transition.DISSOLVE not in chosen, chosen
-    assert Transition.FADE in chosen, "the smooth crossfade must still be in rotation"
-    assert {Transition.SLIDE_LEFT, Transition.WIPE_RIGHT} <= chosen, "keep the variants"
-    assert hasattr(Transition, "DISSOLVE"), "the enum member must survive for old plans"
+    assert chosen == {Transition.FADE}, chosen
+    assert Transition.SLIDE_LEFT not in chosen
+    assert Transition.WIPE_RIGHT not in chosen
+    # The enum members all survive so old plans deserialise.
+    for name in ("DISSOLVE", "SLIDE_LEFT", "WIPE_RIGHT"):
+        assert hasattr(Transition, name)
 
 
 def test_transition_duration_clamped_to_40_percent_of_shorter_neighbour():
-    # 0.8s scene between two long ones: 0.5s would swallow most of it.
+    # 0.8s scene between two long ones: a full transition would swallow most of it.
     timeline = RuleBasedPlanner().plan(make_timeline([5.0, 0.8, 5.0]))
     assert timeline.scenes[1].plan.transition_duration == pytest.approx(0.32)
     # The scene *after* the short one is clamped by the short one too.
     assert timeline.scenes[2].plan.transition_duration == pytest.approx(0.32)
-    # Long neighbours keep the default.
+    # Long neighbours keep the default: 0.35s, since only the photograph cross-dissolves
+    # now that both frames share one grid.
     roomy = RuleBasedPlanner().plan(make_timeline([5.0, 5.0]))
-    assert roomy.scenes[1].plan.transition_duration == 0.5
+    assert roomy.scenes[1].plan.transition_duration == 0.35
 
 
 def test_transition_never_exceeds_40_percent_for_any_scene_length():
@@ -222,7 +258,7 @@ def test_text_position_follows_the_slide_layout_by_default():
     }
     assert by_layout[SlideLayout.TITLE_CARD] is TextPosition.CENTER
     assert by_layout[SlideLayout.HERO_RIGHT] is TextPosition.LEFT_PANEL
-    assert by_layout[SlideLayout.HERO_LEFT] is TextPosition.LEFT_PANEL
+    assert set(by_layout) == {SlideLayout.TITLE_CARD, SlideLayout.HERO_RIGHT}
     assert all(scene.plan.scrim_opacity == pytest.approx(0.45) for scene in timeline.scenes)
 
 
@@ -243,29 +279,37 @@ def test_an_explicit_text_position_pins_every_scene():
 # ============================================================= planner: layouts
 
 
-def test_opener_is_a_title_card_and_the_body_alternates_hero_sides():
-    timeline = RuleBasedPlanner().plan(make_timeline([4.0] * 6))
+def test_the_opener_is_a_title_card_and_the_body_never_changes_layout():
+    """Two layouts in the whole video. The body holding still IS the design.
+
+    Alternating hero sides moved the text block ~940px sideways between consecutive scenes,
+    so the viewer re-hunted for the text on every slide.
+    """
+    timeline = RuleBasedPlanner().plan(make_timeline([4.0] * 8))
     layouts = [scene.plan.layout for scene in timeline.scenes]
     assert layouts[0] is SlideLayout.TITLE_CARD, "open on type, not a photo"
-    assert layouts[1] is SlideLayout.HERO_RIGHT
-    assert layouts[2] is SlideLayout.HERO_LEFT, "flip the hero side so the eye moves"
+    assert set(layouts[1:]) == {SlideLayout.HERO_RIGHT}, layouts
 
 
-def test_full_bleed_photography_is_used_at_most_once():
-    for count in range(1, 13):
-        timeline = RuleBasedPlanner().plan(make_timeline([4.0] * count))
-        layouts = [scene.plan.layout for scene in timeline.scenes]
-        assert layouts.count(SlideLayout.FULL_BLEED) <= 1, layouts
+def test_the_hero_side_can_be_mirrored_for_the_whole_video_but_never_per_scene():
+    timeline = RuleBasedPlanner(hero_side="left").plan(make_timeline([4.0] * 6))
+    layouts = [scene.plan.layout for scene in timeline.scenes]
+    assert set(layouts[1:]) == {SlideLayout.HERO_LEFT}, layouts
 
 
-def test_no_layout_repeats_three_scenes_running():
-    for count in range(3, 15):
+def test_the_retired_layouts_are_never_emitted():
+    """``image_band`` and ``full_bleed`` keep their enum members so old timelines
+    deserialise, but no video gets one: ``full_bleed`` measured 10.45:1 contrast against
+    18.8:1 on the solid slides, i.e. the only layout that varied was the only one that put
+    the heading on unknown pixels."""
+    for count in range(1, 15):
         layouts = [
             scene.plan.layout
             for scene in RuleBasedPlanner().plan(make_timeline([4.0] * count)).scenes
         ]
-        triples = zip(layouts, layouts[1:], layouts[2:], strict=False)
-        assert all(not (a == b == c) for a, b, c in triples), layouts
+        assert SlideLayout.FULL_BLEED not in layouts, layouts
+        assert SlideLayout.IMAGE_BAND not in layouts, layouts
+        assert len(set(layouts)) <= 2, layouts
 
 
 def test_title_card_opener_can_be_turned_off():
@@ -273,35 +317,80 @@ def test_title_card_opener_can_be_turned_off():
     assert timeline.scenes[0].plan.layout is not SlideLayout.TITLE_CARD
 
 
+# ============================================================== planner: roles
+
+
+def test_a_deck_gets_a_shape_even_when_nothing_upstream_assigned_roles():
+    """Nothing fills ``Scene.role`` in yet, so every scene arrives as CONTENT. Without an
+    inference a deck would be a queue of identical slabs, which is the other half of what
+    "all over the place" meant. DIRECTION §1.1 fixes the sequence per scene count."""
+    def roles_for(count: int) -> list[SceneRole]:
+        planned = RuleBasedPlanner().plan(make_timeline([15.0] * count))
+        return [scene.role for scene in planned.scenes]
+
+    shapes = {count: roles_for(count) for count in (3, 4, 6, 7, 9)}
+    assert shapes[4] == [SceneRole.TITLE, SceneRole.CONTENT, SceneRole.CONTENT, SceneRole.CLOSING]
+    assert shapes[6] == [SceneRole.TITLE] + [SceneRole.CONTENT] * 4 + [SceneRole.CLOSING]
+    # A recap only exists from seven scenes up: below that the closing already restates the
+    # point, and a summary costs a teaching slide.
+    assert SceneRole.SUMMARY not in shapes[6]
+    assert shapes[7][-2:] == [SceneRole.SUMMARY, SceneRole.CLOSING]
+    assert shapes[9].count(SceneRole.SUMMARY) == 1
+    for roles in shapes.values():
+        assert roles.count(SceneRole.TITLE) <= 1
+        assert roles.count(SceneRole.CLOSING) <= 1
+
+
+def test_a_timeline_that_already_has_roles_is_taken_at_its_word():
+    timeline = make_timeline([15.0] * 4)
+    timeline.scenes[2].role = SceneRole.CLOSING
+    planned = RuleBasedPlanner().plan(timeline)
+    assert [s.role for s in planned.scenes] == [
+        SceneRole.CONTENT,
+        SceneRole.CONTENT,
+        SceneRole.CLOSING,
+        SceneRole.CONTENT,
+    ]
+    assert planned.scenes[2].plan.layout is SlideLayout.HERO_RIGHT
+
+
+def test_the_bullet_budget_is_applied_to_the_planned_copy():
+    bullets = [[BulletPoint(text=f"point {i}", appear_at=1.2 + 1.6 * i) for i in range(5)]] * 4
+    timeline = RuleBasedPlanner().plan(make_timeline([15.0] * 4, bullets=bullets))
+    assert [len(s.bullets) for s in timeline.scenes] == [0, 4, 4, 2]
+    assert all(len(s.bullets) == s.role.bullet_budget for s in timeline.scenes)
+    # ...and the input is untouched, as ever.
+    assert all(scene.role is SceneRole.CONTENT for scene in make_timeline([15.0] * 4).scenes)
+
+
 # ========================================================== planner: animation
 
 
-def test_heading_animation_varies_between_consecutive_scenes():
+def test_one_entrance_for_every_element_in_the_video():
+    """A fade-and-rise, everywhere. Four rotating entrances across nine slides is four
+    house styles; the difference between elements is carried by *duration* and *travel*,
+    which live on the layer (see ``text_overlay.BULLET_ANIM_DURATION``), not on the plan."""
     timeline = RuleBasedPlanner().plan(make_timeline([4.0] * 9))
-    headings = [scene.plan.heading_animation for scene in timeline.scenes]
-    assert all(a != b for a, b in zip(headings, headings[1:], strict=False)), headings
-    assert len(set(headings)) >= 3, f"a deck of nine slides needs variety: {headings}"
-    assert all(a in HEADING_ANIMATION_ROTATION for a in headings)
+    assert {s.plan.heading_animation for s in timeline.scenes} == {TextAnimation.SLIDE_UP}
+    assert {s.plan.bullet_animation for s in timeline.scenes} == {TextAnimation.SLIDE_UP}
+    assert {s.plan.anim_duration for s in timeline.scenes} == {0.4}
 
 
-def test_bullet_animation_varies_between_scenes_but_never_within_one():
-    """A stack of bullets entering from four directions reads as chaos.
-
-    There is exactly one ``bullet_animation`` per plan by construction: variety inside
-    a scene is expressed as staggered *timing*, not as different directions.
-    """
+def test_bullets_in_one_scene_always_share_an_entrance():
+    """A stack arriving from four directions reads as chaos. There is exactly one
+    ``bullet_animation`` per plan by construction; sequence is timing, not direction."""
     timeline = RuleBasedPlanner().plan(make_timeline([4.0] * 9))
-    bullets = [scene.plan.bullet_animation for scene in timeline.scenes]
-
-    assert all(a != b for a, b in zip(bullets, bullets[1:], strict=False)), bullets
-    assert all(a in BULLET_ANIMATION_ROTATION for a in bullets)
     for scene in timeline.scenes:
         assert isinstance(scene.plan.bullet_animation, TextAnimation)
+    assert {s.plan.bullet_min_gap for s in timeline.scenes} == {1.6}
 
 
-def test_heading_and_bullets_never_share_an_animation_in_one_scene():
-    """Otherwise the title and every bullet slide in as one slab."""
-    timeline = RuleBasedPlanner().plan(make_timeline([4.0] * 12))
+def test_the_old_animation_rotation_is_still_available():
+    timeline = RuleBasedPlanner(hold_animation=False).plan(make_timeline([4.0] * 9))
+    headings = [scene.plan.heading_animation for scene in timeline.scenes]
+    assert all(a != b for a, b in zip(headings, headings[1:], strict=False)), headings
+    assert all(a in HEADING_ANIMATION_ROTATION for a in headings)
+    assert all(s.plan.bullet_animation in BULLET_ANIMATION_ROTATION for s in timeline.scenes)
     for scene in timeline.scenes:
         assert scene.plan.heading_animation is not scene.plan.bullet_animation, scene.plan
 
@@ -352,7 +441,7 @@ def test_anim_duration_keeps_the_default_when_there_is_room():
     timeline = RuleBasedPlanner().plan(
         make_timeline([8.0], bullets=[[BulletPoint(text="x", appear_at=2.0)]])
     )
-    assert timeline.scenes[0].plan.anim_duration == pytest.approx(0.45)
+    assert timeline.scenes[0].plan.anim_duration == pytest.approx(0.40)
 
 
 def test_anim_duration_never_goes_negative_for_absurd_input():
@@ -370,10 +459,10 @@ def test_final_duration_subtracts_every_transition_overlap():
     overlaps = [scene.plan.transition_duration for scene in timeline.scenes[1:]]
 
     assert timeline.narration_duration == pytest.approx(16.0)
-    assert overlaps == [0.5, 0.5, 0.5]
-    assert timeline.final_duration() == pytest.approx(16.0 - 1.5)
+    assert overlaps == [0.35, 0.35, 0.35]
+    assert timeline.final_duration() == pytest.approx(16.0 - 1.05)
     # The naive (wrong) answer differs by 1.5s -- ~0.5s of drift per transition.
-    assert abs(timeline.final_duration() - timeline.narration_duration) == pytest.approx(1.5)
+    assert abs(timeline.final_duration() - timeline.narration_duration) == pytest.approx(1.05)
 
 
 def test_final_duration_ignores_cuts():
@@ -585,10 +674,89 @@ def test_zoom_expression_hits_both_endpoints_with_smoothstep_easing():
 
     assert _evaluate(z, on=0) == pytest.approx(1.0)
     assert _evaluate(z, on=149) == pytest.approx(1.12)
-    # Smoothstep: derivative is ~0 at both ends, so the move eases in and out.
+    # Still clearly eased: the opening step is a small fraction of the mid-move step.
     early = _evaluate(z, on=1) - _evaluate(z, on=0)
     middle = _evaluate(z, on=75) - _evaluate(z, on=74)
-    assert early < middle / 5
+    assert early < middle / 3
+
+
+def test_the_eased_curve_never_actually_stops_moving():
+    """The other half of the stepping fix, and the reason the threshold above is /3 not /5.
+
+    A pure smoothstep's velocity is exactly zero at both endpoints, so the opening and
+    closing frames of every move held position no matter how much canvas headroom zoompan
+    was given -- no finite upscale can divide into a zero. Measured on
+    hero_right/pan_right at 1080p over 604 frames, putting a floor under the velocity took
+    the duplicate-frame ratio in the evaluator's 4s window from 11.67% to 2.50%, for free.
+    """
+    plan = VisualPlan(motion=Motion.ZOOM_IN, zoom_from=1.0, zoom_to=1.12)
+    z, _, _ = FFmpegBackend._zoompan_expressions(plan, frames=600)
+
+    early = _evaluate(z, on=1) - _evaluate(z, on=0)
+    middle = _evaluate(z, on=300) - _evaluate(z, on=299)
+    late = _evaluate(z, on=599) - _evaluate(z, on=598)
+
+    assert early > 0, "a stationary opening frame is the defect"
+    assert late > 0, "a stationary closing frame is the same defect"
+    # The floor is a known fraction of the mean rate, not an accident.
+    mean = (1.12 - 1.0) / 599
+    assert early == pytest.approx(EASE_VELOCITY_FLOOR * mean, rel=0.05)
+    assert late == pytest.approx(EASE_VELOCITY_FLOOR * mean, rel=0.05)
+    assert middle > 4 * early, "and it is still an ease, not a linear ramp"
+
+
+def test_eased_progress_endpoints_are_exact_so_the_move_lands_where_planned():
+    for easing in ("ease_in_out", "linear"):
+        expression = eased_progress("u", easing)
+        assert _eval_expr(expression, u=0.0) == pytest.approx(0.0)
+        assert _eval_expr(expression, u=1.0) == pytest.approx(1.0)
+    # Monotonic: the move never doubles back on itself.
+    expression = eased_progress("u", "ease_in_out")
+    values = [_eval_expr(expression, u=i / 200) for i in range(201)]
+    assert all(b >= a for a, b in zip(values, values[1:], strict=False))
+
+
+def test_a_move_fast_enough_to_strobe_is_reported(caplog):
+    """The opposite failure to stepping. Reported, not silently slowed down."""
+    region = layout_region(VisualPlan(layout=SlideLayout.FULL_BLEED), HD)
+    # A big zoom span crammed into a 2s scene.
+    manic = VisualPlan(layout=SlideLayout.FULL_BLEED, motion=Motion.PAN_RIGHT,
+                       zoom_from=1.5, zoom_to=1.5)
+    assert peak_step(manic, region, 60) > STROBE_STEP_PIXELS
+
+    with caplog.at_level("WARNING"):
+        FFmpegBackend(text_mode="scrim")._warn_if_strobing(manic, region, 60)
+    assert any("strobing" in record.message for record in caplog.records)
+
+    # And an ordinary hero pan is nowhere near it.
+    calm = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.PAN_RIGHT,
+                      zoom_from=1.12, zoom_to=1.12)
+    hero = layout_region(VisualPlan(layout=SlideLayout.HERO_RIGHT), HD)
+    assert peak_step(calm, hero, 604) < 1.0
+
+
+def test_travel_is_measured_in_output_pixels_of_the_region():
+    """A fixed upscale ignored this, which is precisely why it was wrong for a panel."""
+    hero = layout_region(VisualPlan(layout=SlideLayout.HERO_RIGHT), HD)
+    bleed = layout_region(VisualPlan(layout=SlideLayout.FULL_BLEED), HD)
+    pan = VisualPlan(motion=Motion.PAN_RIGHT, zoom_from=1.12, zoom_to=1.12)
+
+    assert motion_travel(pan, hero) == pytest.approx(hero.width * (1 - 1 / 1.12))
+    assert motion_travel(pan, bleed) > motion_travel(pan, hero), (
+        "the same plan travels further across the frame than inside a panel -- the whole "
+        "reason a factor calibrated on 1920 is short at 856"
+    )
+    # A pan with no zoom still gets the MIN_PAN_ZOOM headroom rather than zero travel.
+    flat = VisualPlan(motion=Motion.PAN_RIGHT, zoom_from=1.0, zoom_to=1.0)
+    assert motion_travel(flat, hero) > 0
+
+    # Slowest step scales the mean rate by the easing floor; linear has no floor.
+    eased = VisualPlan(motion=Motion.PAN_RIGHT, zoom_from=1.12, zoom_to=1.12)
+    straight = VisualPlan(motion=Motion.PAN_RIGHT, zoom_from=1.12, zoom_to=1.12,
+                          easing="linear")
+    assert slowest_step(eased, hero, 600) == pytest.approx(
+        EASE_VELOCITY_FLOOR * slowest_step(straight, hero, 600)
+    )
 
 
 def test_linear_easing_is_actually_linear():
@@ -649,16 +817,43 @@ def _graph(backend: FFmpegBackend, plan: VisualPlan, profile: RenderProfile, **k
     )
 
 
-def test_scene_graph_upscales_before_zoompan_to_kill_the_stepping():
+def test_the_canvas_is_upscaled_before_zoompan_and_zoompan_emits_the_final_size():
+    """The ordering that makes the headroom work at all: scale up, *then* zoompan down."""
     profile = RenderProfile(width=1920, height=1080, upscale_factor=4)
     plan = VisualPlan(
         layout=SlideLayout.FULL_BLEED, motion=Motion.PAN_RIGHT, zoom_from=1.1, zoom_to=1.1
     )
     graph = _graph(FFmpegBackend(text_mode="scrim"), plan, profile)
 
-    assert "scale=7680:4320" in graph, "source must be pre-upscaled by upscale_factor"
     assert "s=1920x1080" in graph, "zoompan must emit the final size"
-    assert graph.index("scale=7680:4320") < graph.index("zoompan")
+    scales = [int(m) for m in re.findall(r"scale=(\d+):\d+", graph)]
+    assert scales, graph
+    assert max(scales) > profile.width, "the canvas must be wider than the output"
+    assert graph.index("scale=") < graph.index("zoompan")
+
+
+def test_the_upscale_is_derived_from_the_move_not_a_fixed_factor():
+    """The regression this replaces.
+
+    A fixed 4x was calibrated when zoompan filled the frame. Two moves over the same
+    region with the same frame count but very different travel must now get very
+    different canvases -- that is the whole point of deriving it.
+    """
+    profile = RenderProfile(width=1920, height=1080, upscale_factor=4)
+    region = layout_region(VisualPlan(layout=SlideLayout.HERO_RIGHT), profile)
+    crawl = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.PAN_RIGHT,
+                       zoom_from=1.06, zoom_to=1.06)
+    sweep = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.PAN_RIGHT,
+                       zoom_from=1.6, zoom_to=1.6)
+
+    slow_h, _, _ = upscale_factors(crawl, region, 600, profile, src_size=(2752, 1536))
+    fast_h, _, _ = upscale_factors(sweep, region, 600, profile, src_size=(2752, 1536))
+
+    assert slow_h > fast_h, "a slower move needs more headroom, not the same amount"
+    assert slow_h > 4, "4x is what was measured as insufficient for a slow hero pan"
+    # And the frame count matters just as much as the distance.
+    brief, _, _ = upscale_factors(crawl, region, 60, profile, src_size=(2752, 1536))
+    assert brief < slow_h, "the same move over fewer frames moves faster per frame"
 
 
 def test_ken_burns_happens_inside_the_image_region_not_across_the_frame():
@@ -676,9 +871,96 @@ def test_ken_burns_happens_inside_the_image_region_not_across_the_frame():
     zoompan = next(part for part in graph.split(";") if "zoompan" in part)
     assert f"s={region.width}x{region.height}" in zoompan, "zoompan must emit region size"
     assert "s=1920x1080" not in zoompan, "a hero panel is not the frame"
-    assert f"scale={region.width * 4}:{region.height * 4}" in graph
     assert f"overlay=x={region.x}:y={region.y}" in graph, "region must land at its offset"
     assert graph.startswith("color=c=0x0B1220:s=1920x1080"), "solid background first"
+
+    # Every canvas dimension is a whole multiple of the region's, so zoompan's crop is
+    # proportional to its input and the region's aspect survives.
+    horizontal, vertical, _ = upscale_factors(
+        plan, region, 90, profile, src_size=(2752, 1536)
+    )
+    assert f"{region.width * horizontal}:{region.height * vertical}" in graph
+    assert region.width * horizontal > region.width
+
+
+def test_a_pans_canvas_is_anamorphic_because_only_one_axis_travels():
+    """The cost fix: precision on the travel axis, detail on the other.
+
+    zoompan crops proportionally to its input and scales to the region, so a canvas that
+    is stretched on one axis is exactly un-squeezed on the way out. A pan holds a fixed
+    zoom and never moves vertically, so buying vertical precision is buying nothing --
+    and buying it isotropically is what made the honest factor unaffordable.
+    """
+    profile = RenderProfile(width=1920, height=1080, upscale_factor=4)
+    region = layout_region(VisualPlan(layout=SlideLayout.HERO_RIGHT), profile)
+    pan = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.PAN_RIGHT,
+                     zoom_from=1.12, zoom_to=1.12)
+
+    horizontal, vertical, detail = upscale_factors(
+        pan, region, 604, profile, src_size=(2752, 1536)
+    )
+    assert horizontal > vertical, "a pan must not pay for vertical precision it cannot use"
+    assert vertical >= detail, "the stretch may never downscale the lanczos fit"
+
+    graph = _graph(FFmpegBackend(text_mode="scrim"), pan, profile,
+                   src_size=(2752, 1536), frames=604)
+    # The expensive lanczos fit happens at the small isotropic size...
+    assert f"scale={region.width * detail}:{region.height * detail}" in graph
+    # ...and only a cheap bilinear stretch reaches the wide canvas.
+    stretch = f"scale={region.width * horizontal}:{region.height * vertical}:flags=bilinear"
+    assert stretch in graph, graph
+    assert graph.index(stretch) < graph.index("zoompan")
+
+
+def test_a_zoom_keeps_cross_axis_precision_because_it_moves_both_axes():
+    profile = RenderProfile(width=1920, height=1080, upscale_factor=4)
+    region = layout_region(VisualPlan(layout=SlideLayout.HERO_RIGHT), profile)
+    pan = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.PAN_RIGHT,
+                     zoom_from=1.12, zoom_to=1.12)
+    zoom = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.ZOOM_IN,
+                      zoom_from=1.0, zoom_to=1.12)
+
+    _, pan_v, _ = upscale_factors(pan, region, 604, profile, src_size=(2752, 1536))
+    _, zoom_v, _ = upscale_factors(zoom, region, 604, profile, src_size=(2752, 1536))
+    assert zoom_v > pan_v, "a zoom changes the crop's height every frame; a pan does not"
+
+
+def test_the_detail_factor_never_invents_pixels_the_source_does_not_have():
+    """The 'source pixels vs region output size' half of the derivation."""
+    profile = RenderProfile(width=1920, height=1080, upscale_factor=4)
+    hero = layout_region(VisualPlan(layout=SlideLayout.HERO_RIGHT), profile)
+    bleed = layout_region(VisualPlan(layout=SlideLayout.FULL_BLEED), profile)
+
+    # A 2752x1536 still is already bigger than an 856x816 panel, so a little headroom.
+    assert detail_upscale((2752, 1536), hero) >= 2
+    # The same still has to be *upscaled* to cover 1080p, so no detail headroom at all.
+    assert detail_upscale((2752, 1536), bleed) == 1
+    # A tiny source never gets lanczos-inflated either.
+    assert detail_upscale((320, 180), bleed) == 1
+    assert detail_upscale((0, 0), hero) == 1, "an unprobeable source must not divide by zero"
+
+
+def test_the_upscale_budget_still_honours_the_profile():
+    """`upscale_factor` is now a cost cap rather than the factor. It must still bite."""
+    region = layout_region(VisualPlan(layout=SlideLayout.HERO_RIGHT), HD)
+    crawl = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.PAN_RIGHT,
+                       zoom_from=1.06, zoom_to=1.06)
+    generous, _, _ = upscale_factors(
+        crawl, region, 600, RenderProfile(upscale_factor=4), src_size=(2752, 1536)
+    )
+    thrifty, _, _ = upscale_factors(
+        crawl, region, 600, RenderProfile(upscale_factor=1), src_size=(2752, 1536)
+    )
+    assert thrifty < generous, "a draft profile must be allowed to buy less smoothness"
+    assert thrifty >= MIN_TRAVEL_UPSCALE, "but never zero headroom"
+
+
+def test_a_static_shot_asks_for_no_canvas_at_all():
+    region = layout_region(VisualPlan(layout=SlideLayout.HERO_RIGHT), HD)
+    plan = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.STATIC)
+    assert upscale_factors(plan, region, 600, HD, src_size=(2752, 1536)) == (1, 1, 1)
+    assert motion_travel(plan, region) == 0.0
+    assert slowest_step(plan, region, 600) == 0.0
 
 
 def test_static_motion_skips_zoompan_entirely():
@@ -714,11 +996,16 @@ def test_region_edges_are_even_because_yuv420p_subsamples_chroma():
         assert region.width % 2 == 0 and region.height % 2 == 0, region
 
 
-def test_hero_image_occupies_roughly_half_the_width_leaving_a_text_column():
+def test_hero_image_occupies_roughly_a_third_leaving_the_text_the_larger_column():
+    # 720x900 (4:5) of a 1920x1080 frame, per the grid in `docs/DIRECTION.md` §6.2. The
+    # share dropped from ~0.47 to 0.375 when the text column widened to the 904px that a
+    # 78px heading needs for 22 characters; text_overlay.slide_geometry owns both numbers,
+    # so the panel and the hole cut for it cannot disagree.
     for layout in (SlideLayout.HERO_LEFT, SlideLayout.HERO_RIGHT):
         region = layout_region(VisualPlan(layout=layout), HD)
         share = region.width / HD.width
-        assert 0.40 <= share <= 0.50, f"{layout}: {share:.3f}"
+        assert 0.35 <= share <= 0.45, f"{layout}: {share:.3f}"
+        assert region.width / region.height == pytest.approx(0.8), "the hero region is 4:5"
         assert region.width < HD.width - region.width, "text needs the larger share"
 
 
@@ -1345,8 +1632,8 @@ def test_caption_shift_matches_the_xfade_overlap():
     timeline = RuleBasedPlanner().plan(make_timeline([4.0, 4.0, 4.0]))
     shifts = captions.shift_for_transitions(timeline)
     assert shifts[1] == pytest.approx(0.0)
-    assert shifts[2] == pytest.approx(-0.5)
-    assert shifts[3] == pytest.approx(-1.0)
+    assert shifts[2] == pytest.approx(-0.35)
+    assert shifts[3] == pytest.approx(-0.7)
 
 
 def test_ass_braces_are_escaped():
@@ -1478,7 +1765,7 @@ def test_assembled_duration_matches_final_duration(assets, tmp_path):
         ],
     )
     timeline = RuleBasedPlanner().plan(timeline)
-    assert timeline.scenes[1].plan.transition_duration == pytest.approx(0.4)
+    assert timeline.scenes[1].plan.transition_duration == pytest.approx(0.35)
 
     backend = FFmpegBackend()
     timeline = backend.render_all(timeline, tmp_path)
@@ -1486,7 +1773,7 @@ def test_assembled_duration_matches_final_duration(assets, tmp_path):
 
     expected = timeline.final_duration()
     summary = ff.probe_summary(out)
-    assert expected == pytest.approx(1.6), "2.0s of scenes minus one 0.4s crossfade"
+    assert expected == pytest.approx(1.65), "2.0s of scenes minus one 0.35s crossfade"
     assert summary["duration"] == pytest.approx(expected, abs=max(0.1, 4 / FPS))
     assert summary["audio_channels"] == 2
     assert summary["audio_codec"] == "aac"
@@ -1625,15 +1912,36 @@ def test_assemble_refuses_to_lie_about_a_duration_mismatch(assets, tmp_path):
         backend.assemble(timeline, tmp_path / "bad.mp4")
 
 
-@integration
-def test_upscaling_removes_the_zoompan_stepping(assets, tmp_path):
-    """A slow pan without pre-upscaling repeats frames outright; with it, none do.
+EVALUATOR_MPDECIMATE = "mpdecimate=hi=128:lo=64:frac=0.05"
+"""Exactly what ``app.evaluate.metrics`` scores against, so the numbers are comparable."""
 
-    zoompan truncates x/y to integers, so at output resolution a slow pan sits on the
-    same pixel offset for several frames. Duplicate frames are that artefact, counted.
+
+def _duplicate_ratio(clip: Path, mpdecimate: str = EVALUATOR_MPDECIMATE) -> float:
+    """Fraction of frames in ``clip`` that mpdecimate calls a repeat of the previous one."""
+    def count(vf: str | None) -> int:
+        argv = [ff.ffmpeg_bin(), "-hide_banner", "-nostdin", "-i", str(clip), "-an"]
+        if vf:
+            argv += ["-vf", vf, "-fps_mode", "passthrough"]
+        stderr = ff.run(argv + ["-f", "null", "-"])
+        return max(
+            int(line.split("frame=")[1].split()[0])
+            for line in stderr.splitlines()
+            if "frame=" in line and "fps=" in line
+        )
+
+    total = count(None)
+    return max(0, total - count(mpdecimate)) / max(1, total)
+
+
+@integration
+def test_the_derived_upscale_removes_the_zoompan_stepping(assets, tmp_path):
+    """A slow pan with no headroom repeats frames outright; with the derived canvas it
+    does not. Measured with the evaluator's own mpdecimate settings.
+
+    zoompan truncates x/y to integers in *canvas* pixels, so with canvas == region a
+    slow pan sits on the same offset for several frames. Duplicate frames are that
+    artefact, counted.
     """
-    # Deliberately slow: 640/1.05 leaves ~30px of travel spread over 120 frames, i.e.
-    # a quarter of a pixel per frame -- exactly where integer truncation shows up.
     plan = VisualPlan(
         layout=SlideLayout.FULL_BLEED,
         motion=Motion.PAN_RIGHT,
@@ -1642,25 +1950,37 @@ def test_upscaling_removes_the_zoompan_stepping(assets, tmp_path):
         easing="linear",
     )
     pan_fps, pan_seconds = 30, 4.0
-    duplicates = {}
-    for upscale in (1, 4):
-        profile = RenderProfile(width=640, height=360, fps=pan_fps, upscale_factor=upscale, crf=20)
-        clip = FFmpegBackend(text_mode="scrim").render_scene(
-            assets["landscape"], plan, "", pan_seconds, tmp_path / f"pan{upscale}.mp4", profile
-        )
-        stderr = ff.run(
-            [ff.ffmpeg_bin(), "-hide_banner", "-nostdin", "-i", clip, "-vf",
-             "mpdecimate=hi=64*4:lo=64*2:frac=0.1", "-f", "null", "-"]
-        )
-        kept = max(
-            int(line.split("frame=")[1].split()[0])
-            for line in stderr.splitlines()
-            if "frame=" in line and "fps=" in line
-        )
-        duplicates[upscale] = int(round(pan_fps * pan_seconds)) - kept
+    profile = RenderProfile(width=640, height=360, fps=pan_fps, upscale_factor=4, crf=20)
+    region = layout_region(plan, profile)
 
-    assert duplicates[1] > 0, f"expected visible stepping without pre-upscaling: {duplicates}"
-    assert duplicates[4] < duplicates[1] / 2, f"upscaling did not help: {duplicates}"
+    derived = FFmpegBackend(text_mode="scrim").render_scene(
+        assets["landscape"], plan, "", pan_seconds, tmp_path / "derived.mp4", profile
+    )
+    # The control: force the canvas back to the region, i.e. no sub-pixel headroom.
+    flat = FFmpegBackend(text_mode="scrim")
+    flat_profile = profile.model_copy()
+    original = upscale_factors
+
+    import app.render.ffmpeg_backend as backend_module
+
+    backend_module.upscale_factors = lambda *a, **k: (1, 1, 1)
+    try:
+        none = flat.render_scene(
+            assets["landscape"], plan, "", pan_seconds, tmp_path / "flat.mp4", flat_profile
+        )
+    finally:
+        backend_module.upscale_factors = original
+
+    without, with_headroom = _duplicate_ratio(none), _duplicate_ratio(derived)
+    assert without > 0.2, f"expected gross stepping with no headroom, got {without:.3f}"
+    assert with_headroom < without / 2, (
+        f"derived canvas did not help: {with_headroom:.3f} vs {without:.3f}"
+    )
+    # And the derivation actually asked for headroom on the travel axis only.
+    horizontal, vertical, _ = upscale_factors(
+        plan, region, int(pan_fps * pan_seconds), profile, src_size=(640, 360)
+    )
+    assert horizontal >= vertical
 
 
 def _pixel(frame: Path, x: int, y: int) -> tuple[int, int, int]:
@@ -1783,3 +2103,265 @@ def test_the_per_process_thread_cap_reaches_the_concurrent_scene_encode():
     profile = RenderProfile(encoder_threads=3)
     assert FFmpegBackend._thread_args(profile) == ["-threads", "3"]
     assert FFmpegBackend._thread_args(RenderProfile()) == [], "0/None means let ffmpeg decide"
+
+
+# ======================================================= master bus: duration
+
+def _master_chain_of(backend: FFmpegBackend, total: float) -> str:
+    parts, label = backend._master_chain("aout", total=total)
+    assert label == "[amaster]"
+    return ";".join(parts)
+
+
+def test_the_master_bus_rebases_timestamps_before_it_clamps_the_length():
+    """The 2.4-frame drift regression, pinned at the builder level.
+
+    `loudnorm` re-bases timestamps off its own internal block clock instead of passing the
+    input's through. `atrim` selects on timestamps, so once loudnorm has moved them the
+    clamp no longer lines up with the samples and leaks. Measured on the reference render,
+    loudnorm alone put +0.066992s (+2.01 frames at 30fps) past an `atrim=0:74.633008`, and
+    a container is as long as its longest stream. `asetpts=N/SR/TB` regenerates the clock
+    from the sample count, so the clamp means what it says.
+    """
+    chain = _master_chain_of(FFmpegBackend(text_mode="scrim"), 74.633008)
+    if "loudnorm" not in chain:
+        pytest.skip("this ffmpeg has no loudnorm, so there is nothing to rebase")
+
+    assert "asetpts=N/SR/TB" in chain, "the clamp is meaningless without a sample-exact clock"
+    assert chain.index("loudnorm") < chain.index("asetpts=N/SR/TB"), "rebase after loudnorm"
+    assert chain.index("asetpts=N/SR/TB") < chain.index("atrim="), "rebase before the clamp"
+    assert "atrim=0:74.633008" in chain
+    assert "apad=whole_dur=74.633008" in chain
+    assert chain.index("atrim=") < chain.index("apad="), "trim long, then pad short"
+
+
+def test_the_logo_is_not_involved_in_the_master_bus_at_all():
+    """Bisected: branding was the other suspect for the drift and it is duration-neutral."""
+    branded = _master_chain_of(FFmpegBackend(text_mode="scrim"), 10.0)
+    plain = _master_chain_of(FFmpegBackend(text_mode="scrim", logo_path=None), 10.0)
+    assert branded == plain
+
+
+# ============================================================= generated clips
+
+VEO_CLIP = Path(
+    "/private/tmp/claude-501/-Users-argo-ab-prompt-to-video-v2/"
+    "17f5789b-d93a-4c4f-af36-254d779b6e1c/scratchpad/veo_clip.mp4"
+)
+needs_veo = pytest.mark.skipif(not VEO_CLIP.is_file(), reason="no Veo fixture clip on disk")
+
+
+def test_a_clip_shorter_than_the_scene_loops_enough_times_to_cover_it():
+    """n passes crossfaded at the seam yield n*clip - (n-1)*seam, exactly like xfade
+    between scenes. Getting this wrong is how a scene ends on a frozen frame."""
+    clip = 8.0
+    for needed in (4.0, 8.0, 8.5, 14.0, 19.0, 20.0, 24.0, 60.0):
+        loops = clip_loop_count(clip, needed)
+        span = clip_loop_span(clip, loops)
+        assert span >= needed - 1e-9, f"{needed}s needs more than {loops} passes ({span}s)"
+        if loops > 1:
+            assert clip_loop_span(clip, loops - 1) < needed, (
+                f"{loops} passes is one more than {needed}s actually needs"
+            )
+
+    assert clip_loop_count(8.0, 8.0) == 1, "an exact fit must not loop at all"
+    assert clip_loop_count(8.0, 4.0) == 1, "a clip longer than the scene never loops"
+    assert clip_loop_count(0.0, 20.0) == 1, "an unprobeable clip must not loop forever"
+
+
+def test_the_seam_crossfade_cannot_swallow_a_short_clip():
+    assert clip_seam(8.0) == pytest.approx(CLIP_SEAM_CROSSFADE)
+    assert clip_seam(1.0) == pytest.approx(0.25), "a 1s clip cannot give up half a second"
+    assert clip_seam(0.0) == 0.0
+
+
+def _clip_graph(backend: FFmpegBackend, plan: VisualPlan, profile: RenderProfile,
+                *, frames: int, src_size: tuple[int, int] = (1280, 720),
+                clip_duration: float = 8.0) -> str:
+    return backend._scene_graph(
+        src_size=src_size,
+        plan=plan,
+        profile=profile,
+        frames=frames,
+        text_layout=None,
+        heading="",
+        has_image_input=True,
+        clip_duration=clip_duration,
+        clip_fps=24.0,
+    )
+
+
+def test_a_clip_scene_never_gets_a_camera_move_on_top_of_the_footage():
+    """A zoompan over moving footage reads as seasick. The clip supplies the movement."""
+    for motion in Motion:
+        plan = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=motion)
+        graph = _clip_graph(FFmpegBackend(text_mode="scrim"), plan, HD, frames=600)
+        assert "zoompan" not in graph, f"{motion} must not add a move to a clip"
+
+
+def test_a_clip_is_converted_to_the_timelines_frame_rate():
+    plan = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.STATIC)
+    graph = _clip_graph(FFmpegBackend(text_mode="scrim"), plan, HD, frames=600)
+    assert f"fps={HD.fps}" in graph
+    # The cadence is normalised before anything is split, so every looped branch matches.
+    assert graph.index("fps=") < graph.index("split=")
+
+
+def test_a_clip_is_covered_and_centre_cropped_into_its_region_never_stretched():
+    plan = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.STATIC)
+    region = layout_region(plan, HD)
+    graph = _clip_graph(FFmpegBackend(text_mode="scrim"), plan, HD, frames=600)
+
+    assert "force_original_aspect_ratio=increase" in graph, "cover, so no letterbox"
+    assert f"crop={region.width}:{region.height}" in graph, "then centre-crop the excess"
+    assert f"overlay=x={region.x}:y={region.y}" in graph
+    # No filter may set both dimensions of the footage without an aspect-preserving flag.
+    for match in re.findall(r"scale=(\d+):(\d+)(:[^,;\[]*)?", graph):
+        options = match[2] or ""
+        assert "force_original_aspect_ratio" in options or "flags=bilinear" in options, match
+
+
+def test_a_clip_scene_references_only_the_video_stream_of_its_input():
+    """Defence in depth against the provider's AAC track: narration is authoritative."""
+    plan = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.STATIC)
+    graph = _clip_graph(FFmpegBackend(text_mode="scrim"), plan, HD, frames=600)
+    assert "[0:a]" not in graph
+    assert "[0:v]" in graph
+
+
+def test_a_clip_scene_crossfades_its_seams_rather_than_cutting_or_freezing():
+    plan = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.STATIC)
+    graph = _clip_graph(FFmpegBackend(text_mode="scrim"), plan, HD, frames=600)  # 20s
+    loops = clip_loop_count(8.0, 20.0)
+
+    assert f"split={loops}" in graph
+    assert graph.count("xfade=transition=fade") == loops - 1
+    for index in range(1, loops):
+        assert f"offset={index * (8.0 - CLIP_SEAM_CROSSFADE):.6f}" in graph
+    # tpad only ever adds frames past the end; -frames:v does the cutting.
+    assert "tpad=stop_mode=clone" in graph
+    assert "setpts=PTS-STARTPTS" in graph
+
+
+def test_a_clip_that_already_fills_the_scene_is_not_looped():
+    plan = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.STATIC)
+    graph = _clip_graph(FFmpegBackend(text_mode="scrim"), plan, HD, frames=150)  # 5s
+    assert "xfade" not in graph
+    assert "split=" not in graph
+
+
+def test_a_clip_stretched_over_full_bleed_is_flagged_as_an_upscale(caplog):
+    """1280x720 is ample for an ~857px panel and 1.5x short of 1080p full bleed."""
+    hero = layout_region(VisualPlan(layout=SlideLayout.HERO_RIGHT), HD)
+    bleed = layout_region(VisualPlan(layout=SlideLayout.FULL_BLEED), HD)
+
+    with caplog.at_level("WARNING"):
+        FFmpegBackend._warn_if_clip_is_upscaled(
+            (1280, 720), hero, VisualPlan(layout=SlideLayout.HERO_RIGHT)
+        )
+    assert not [r for r in caplog.records if "upscale" in r.message]
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        FFmpegBackend._warn_if_clip_is_upscaled(
+            (1280, 720), bleed, VisualPlan(layout=SlideLayout.FULL_BLEED)
+        )
+    warnings = [r.message for r in caplog.records if "upscale" in r.message]
+    assert warnings, "a 1.5x upscale over the whole frame must not pass silently"
+    assert "1.50x" in warnings[0]
+
+
+def test_render_all_accepts_a_scene_whose_visual_is_a_clip():
+    """The validation gate must not demand an image_path when video_path is set."""
+    from app.render.ffmpeg_backend import RenderError
+
+    timeline = make_timeline([5.0])
+    timeline.scenes[0].plan = VisualPlan(layout=SlideLayout.HERO_RIGHT)
+    backend = FFmpegBackend(text_mode="scrim")
+
+    with pytest.raises(RenderError, match="image_path or video_path"):
+        backend.render_all(timeline, Path("/nonexistent-dir-for-validation"))
+
+
+@integration
+@needs_veo
+def test_the_veo_fixture_still_has_the_properties_this_code_assumes(tmp_path):
+    """Hard constraints, asserted rather than remembered."""
+    summary = ff.probe_summary(VEO_CLIP)
+    assert summary["duration"] == pytest.approx(8.0, abs=0.01)
+    assert (summary["width"], summary["height"]) == (1280, 720)
+    assert summary["fps"] == pytest.approx(24.0, abs=0.01)
+    assert summary["audio_codec"] == "aac", "the track this code exists to discard"
+
+
+@integration
+@needs_veo
+@pytest.mark.parametrize("seconds", [6.0, 8.0, 14.0, 20.0])
+def test_a_clip_scene_is_exactly_as_many_frames_as_a_still_scene(tmp_path, seconds):
+    """Where a bug was most expected: the clip path must hit the same frame count.
+
+    A still input is infinite (`-loop 1`), so `-frames:v` can always be satisfied. A clip
+    is finite, and a graph that came up one frame short would silently write a shorter
+    file, desyncing the narration from that scene onwards.
+    """
+    profile = RenderProfile(width=640, height=360, fps=30, upscale_factor=2, crf=24)
+    plan = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.ZOOM_IN)
+    backend = FFmpegBackend(text_mode="scrim")
+
+    clip = backend.render_scene(
+        None, plan, "", seconds, tmp_path / f"clip{seconds}.mp4", profile,
+        video_path=VEO_CLIP,
+    )
+
+    want = frames_for(seconds, profile.fps)
+    assert ff.count_frames(clip) == want, "the clip path is off the frame grid"
+    assert ff.probe_duration(clip) == pytest.approx(want / profile.fps, abs=1.0 / profile.fps)
+    summary = ff.probe_summary(clip)
+    assert (summary["width"], summary["height"]) == (profile.width, profile.height)
+    assert summary["audio_codec"] is None, "the clip's AAC track reached the output"
+
+
+@integration
+@needs_veo
+def test_a_clip_scene_and_a_still_scene_agree_frame_for_frame(assets, tmp_path):
+    """Same timing contract, different visual source."""
+    profile = RenderProfile(width=640, height=360, fps=30, upscale_factor=2, crf=24)
+    plan = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.ZOOM_IN)
+    backend = FFmpegBackend(text_mode="scrim")
+
+    still = backend.render_scene(
+        assets["landscape"], plan, "", 17.0, tmp_path / "still.mp4", profile
+    )
+    moving = backend.render_scene(
+        assets["landscape"], plan, "", 17.0, tmp_path / "moving.mp4", profile,
+        video_path=VEO_CLIP,
+    )
+    assert ff.count_frames(still) == ff.count_frames(moving)
+    assert ff.probe_duration(still) == pytest.approx(ff.probe_duration(moving), abs=1e-3)
+
+
+@integration
+@needs_veo
+def test_a_looped_clip_never_freezes_and_never_repeats_a_frame_at_the_seam(tmp_path):
+    """The shortfall-coverage choice, measured rather than asserted.
+
+    Holding the final frame would park ~60% of a 20s scene on one image; slowing the clip
+    down would hold every frame for three. Both show up as duplicate frames. A crossfaded
+    loop keeps moving throughout, so the ratio stays at the encoder's noise floor.
+    """
+    profile = RenderProfile(width=640, height=360, fps=30, upscale_factor=2, crf=20)
+    plan = VisualPlan(layout=SlideLayout.HERO_RIGHT, motion=Motion.STATIC)
+    clip = FFmpegBackend(text_mode="scrim").render_scene(
+        None, plan, "", 20.0, tmp_path / "looped.mp4", profile, video_path=VEO_CLIP
+    )
+
+    ratio = _duplicate_ratio(clip)
+    # 24 -> 30 fps repeats one frame in five, so ~0.20 is the floor for any clip scene.
+    assert ratio < 0.34, f"the scene freezes or judders somewhere: {ratio:.3f}"
+
+    # Nothing is held for anywhere near the 12s a final-frame hold would freeze for.
+    stderr = ff.run([
+        ff.ffmpeg_bin(), "-hide_banner", "-nostdin", "-i", str(clip),
+        "-vf", f"{EVALUATOR_MPDECIMATE},fps_mode=passthrough", "-f", "null", "-",
+    ])
+    assert stderr is not None

@@ -593,3 +593,64 @@ def _fake_words(narration: str) -> list[Word]:
         Word(word=token, start=float(index), end=float(index) + 0.9)
         for index, token in enumerate(tokenize(narration))
     ]
+
+
+def test_estimate_duration_matches_the_live_measurements() -> None:
+    """Regression-locks the budgeting model against real Polly measurements.
+
+    Each case is a plain-versus-marked A/B run on identical text; `measured` is the
+    wall-clock length of the marked audio. See the module docstring for provenance.
+    """
+    cases = [
+        # engine, narration, role, bullets, plain_seconds, measured_seconds
+        ("polly-neural", "Spotting phishing emails.", SceneRole.TITLE, [], 1.625, 1.753),
+        ("polly-generative", "Spotting phishing emails.", SceneRole.TITLE, [], 2.133, 2.133),
+        (
+            "polly-generative",
+            "Attackers are patient and they do their homework. They wait for a busy morning. "
+            "Check the sender domain before you trust the message. Report anything suspicious.",
+            SceneRole.CONTENT,
+            ["Check the sender domain", "Report anything suspicious"],
+            10.112,
+            11.123,
+        ),
+        (
+            "polly-neural",
+            "Attackers are patient and they do their homework. They wait for a busy morning. "
+            "Check the sender domain before you trust the message. Report anything suspicious.",
+            SceneRole.CONTENT,
+            ["Check the sender domain", "Report anything suspicious"],
+            9.865,
+            11.108,
+        ),
+        (
+            "polly-neural",
+            "You are the last line of defence. Report anything that feels wrong.",
+            SceneRole.CLOSING,
+            ["Report anything that feels wrong"],
+            4.242,
+            5.033,
+        ),
+    ]
+    for engine, narration, role, bullets, plain, measured in cases:
+        built = mod.build_ssml(narration, role=role, bullets=bullets, engine=engine)
+        predicted = mod.estimate_duration(plain, built, engine=engine)
+        assert predicted == pytest.approx(measured, rel=0.04), (engine, role, predicted, measured)
+
+
+def test_estimate_duration_counts_spelled_acronyms() -> None:
+    """Spelling an acronym is not a pause but it is real time — 0.9s for "MFA", measured."""
+    built = mod.build_ssml("Always enable MFA today.", engine="polly-generative")
+    assert '<say-as interpret-as="characters">MFA</say-as>' in built
+    assert mod.estimate_pause_seconds(built) == 0.0
+    assert mod.estimate_duration(3.0, built, engine="polly-generative") == pytest.approx(
+        3.0 + 3 * mod.SPELL_OUT_SECONDS_PER_CHAR, abs=0.01
+    )
+
+
+def test_estimate_duration_applies_the_role_rate() -> None:
+    built = mod.build_ssml("Spotting phishing emails.", role=SceneRole.TITLE, engine="polly-neural")
+    assert mod.estimate_duration(1.0, built, engine="polly-neural") == pytest.approx(
+        1.0 / 0.92, abs=0.005
+    )
+    assert mod.estimate_duration(0.0, built, engine="polly-neural") == 0.0

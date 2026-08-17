@@ -22,6 +22,34 @@ position, so a model that argues with the instruction still yields a shaped scri
 Every number here is `docs/DIRECTION.md`: §1.1 for the sequence per slide count, §1.2 for
 the word and bullet budgets, §2.1/§2.2 for the one-line copy caps, §5 for the 135 wpm pace,
 §9 for the corrections to the committed `SceneRole` values.
+
+LANGUAGE
+--------
+`generate(..., language=...)` writes the script NATIVELY in the target language — narration,
+heading and bullets all in-language, never English-then-translated. Translation is the wrong
+tool twice over: it produces narration that scans as translated when read aloud, and it
+breaks bullet anchoring, because a bullet translated independently of its narration no
+longer quotes it.
+
+Two things do NOT translate, and the split is deliberate:
+
+  * `image_prompt` and `clip_prompt` stay ENGLISH. They are conditioning text for the
+    image and video models, which are English-trained; a Hindi prompt degrades the frame
+    for no benefit, since nothing in a visual prompt is ever seen or heard by a viewer.
+  * the word budgets are not the English ones. A word budget is a DURATION (audio is the
+    clock), so the budget must be scaled by the language's measured speaking rate or the
+    scene overruns its role's window. See `LANGUAGE_WPM`.
+
+ANCHORING IS NOT UNIFORM ACROSS SCRIPTS — the load-bearing caveat. `bullet_timing` matches
+bullets to narration through `deepgram_align.normalize`, which reduces a token to `[a-z0-9]`
+only. Latin scripts survive that (Spanish accents are stripped on BOTH sides, so they still
+compare equal); Devanagari does not — every Hindi token normalises to the empty string, so
+`anchor_position` returns None for every Hindi bullet and `find_anchors` reports
+`proportional` for all of them. `anchoring_supported` PROBES that rather than hardcoding it —
+so this file starts reporting Hindi as anchorable the day `normalize` is widened, instead of
+carrying a stale assumption — and `_clean_bullets` stops second-guessing the model's bullets
+in a script where the check cannot run at all. This is a real product constraint, not a bug
+in this file: fixing it means widening `normalize`, which lives in `deepgram_align`.
 """
 
 from __future__ import annotations
@@ -29,10 +57,11 @@ from __future__ import annotations
 import json
 import logging
 import re
+import unicodedata
 from typing import Any
 
 from app.core.config import get_settings
-from app.core.models import Motion, SceneRole, SceneScript, Script
+from app.core.models import Language, Motion, SceneRole, SceneScript, Script
 from app.providers._gemini import GeminiError, generate_content, text_from
 from app.providers.bullet_timing import anchor_position
 
@@ -139,6 +168,43 @@ ROLE_NARRATION_WORDS: dict[SceneRole, tuple[int, int, int]] = {
     SceneRole.CLOSING: (13, 17, 20),
 }
 
+# Words per minute MEASURED on live TTS, one voice per language, over eight paragraphs of
+# real training narration written natively in each language and saying the SAME EIGHT
+# THINGS — parallel content is what makes the three numbers comparable at all.
+#
+#   en  114.3 wpm (97.7-136.0, sd 15.1)  Deepgram aura-2-draco-en
+#   es  161.5 wpm (127.9-190.6, sd 19.6) Deepgram aura-2-carina-es
+#   hi  183.7 wpm (165.1-200.2, sd 12.1) Polly Kajal, LanguageCode=hi-IN, neural
+#
+# Measured here rather than read off `docs/LANGUAGES.md`, which did not exist when this was
+# written; if it lands later, ITS budgets win over these and this table is what to replace.
+#
+# The English figure is deliberately NOT used to overrule `WORDS_PER_MINUTE`. DIRECTION §5
+# is the authority on the English pace and the committed budgets are built on 135; that the
+# draco voice averages 114 wpm and swings 39% across eight paragraphs is the §5 defect
+# itself, and re-tuning English is not this change. Only the RATIOS are used below, and a
+# ratio cancels whatever pacing bias the measurement carries.
+MEASURED_WPM: dict[Language, float] = {
+    Language.EN: 114.3,
+    Language.ES: 161.5,
+    Language.HI: 183.7,
+}
+
+# Multiplier on every English word budget, per language. Derived, not hand-set: one number
+# per language, so a budget table cannot drift away from the rate it was justified by.
+#
+# It is a rate ratio because the budget is a DURATION, not a word count. The direction is
+# the opposite of the intuition: Spanish and Hindi need MORE words to say the same thing
+# (1.14x and 1.32x here), but their voices speak proportionally FASTER still, so re-using
+# the English budget makes the scene too SHORT rather than too long. A ten-word English
+# title card is 4.4s at 135 wpm but only 3.7s of Spanish — under the 4.0s floor of
+# `SceneRole.TITLE.target_duration`. Scaling by the rate ratio holds the duration fixed,
+# which is the thing the role window actually constrains.
+LANGUAGE_WORD_FACTOR: dict[Language, float] = {
+    language: round(wpm / MEASURED_WPM[Language.EN], 2) for language, wpm in MEASURED_WPM.items()
+}
+"""en 1.0, es 1.41, hi 1.61. Rounded to 2dp so the budgets are stable and quotable."""
+
 # Fewest scenes that earn a recap — `docs/DIRECTION.md` §1.1, which is explicit that a
 # six-slide video does not get one either: below ~100s there is nothing to recap, the
 # closing already restates the key point, and a summary costs a teaching slide to buy.
@@ -194,6 +260,70 @@ declarative, with no hedging and no preamble.""",
 # the function words around it. Below this, splitting produces scraps like "Check The".
 _SPLITTABLE_WORDS = 10
 
+# What the model should call the language it is writing. Named in the language's own terms as
+# well as in English: "write in Spanish" is followed more reliably when the target name is
+# also present in the target language.
+LANGUAGE_NAMES: dict[Language, str] = {
+    Language.EN: "English",
+    Language.ES: "Spanish (español), neutral Latin American",
+    Language.HI: "Hindi (हिन्दी), in the Devanagari script",
+}
+
+# Per-language copy conventions. ONLY the conventions that actually differ — the shared rules
+# (sentence case over Title Case, no terminal punctuation on a heading) stay in the main
+# template, so a language clause is never a restatement of the whole brief.
+#
+# These are typography rules, and imposing English typography on another script is a visible
+# defect: a Devanagari sentence ending in "." reads as a missing danda to anyone who reads
+# Hindi, and Spanish with no opening ¿ reads as machine output.
+LANGUAGE_CLAUSES: dict[Language, str] = {
+    Language.EN: "",
+    Language.ES: """SPANISH CONVENTIONS — write correct, fully accented Spanish
+orthography. Every diacritic that belongs on a word must be there: acentos (á é í ó ú),
+la eñe (ñ), la diéresis (ü). Unaccented Spanish reads as machine output, and dropping an
+accent changes the word — "está" is not "esta", "sí" is not "si". Any question or
+exclamation is opened AND closed with its inverted mark: "¿Reconoce el remitente?",
+"¡No haga clic!" — never only the closing one. Use "usted" throughout and keep it
+consistent; never mix it with "tú" in the same video. Sentence case means Spanish sentence
+case, so do NOT capitalise nouns, adjectives of nationality, days, months or languages the
+way English does. Prefer the plain Spanish term over an English loanword when one exists
+("correo electrónico", "contraseña", "enlace"), but keep an established technical term in
+English where that is what people actually say ("phishing", "malware").""",
+    Language.HI: """HINDI CONVENTIONS — write natural spoken Hindi in the Devanagari
+script, the register of a professional presenter: everyday Hindi, NOT literary or heavily
+Sanskritised vocabulary. Where a technical term is normally said in English, write it in
+Devanagari transliteration as people actually say it (फ़िशिंग, ईमेल, पासवर्ड, लिंक, डोमेन)
+rather than coining an obscure Hindi equivalent nobody would use out loud. End every
+sentence with the danda "।" — NOT a full stop "." — and use "?" and "!" only where the
+sentence really is a question or an exclamation. Devanagari has no upper and lower case, so
+there is nothing to capitalise: ignore every instruction about sentence case and Title
+Case, and do not romanise anything to work around it. Use the respectful "आप" form
+throughout. Spell out digits as Devanagari words, never as numerals. Take care with nukta
+and matra: फ़िशिंग not फिशिग.""",
+}
+
+# How the anchor rule is qualified for the language's grammar. English barely needs one;
+# an inflected language needs telling that the ECHO must be the inflected form the narration
+# itself used, because agreement changes silently break a verbatim match.
+LANGUAGE_ANCHOR_NOTES: dict[Language, str] = {
+    Language.EN: "",
+    Language.ES: """
+    Spanish inflects, and this rule is about SURFACE FORM, not meaning. Copy the phrase
+    across in the EXACT form the narration used it in — same gender, same number, same
+    person, same tense, same article, same enclitic pronoun. If the narration says
+    "verifique el dominio del remitente", the bullet is "El dominio del remitente" or
+    "Verifique el dominio" — NOT "verificar los dominios", which is the same idea in a form
+    that no longer matches a single word of what is spoken. Do not switch an infinitive for
+    an imperative, a singular for a plural, or "el" for "los" on the way to the slide.""",
+    Language.HI: """
+    Hindi inflects heavily and this rule is about SURFACE FORM, not meaning. Copy the run of
+    words across EXACTLY as the narration has them — same postposition (का, के, की, को, से,
+    में), same gender and number agreement, same verb form. Do not convert जांचें to जांचना,
+    do not drop or change a postposition, and do not switch the oblique form for the direct
+    one. If the narration says "भेजने वाले का डोमेन जांचें", the bullet is
+    "भेजने वाले का डोमेन" — the same words, untouched.""",
+}
+
 # Cycled to break up runs of identical camera moves.
 MOTION_CYCLE: tuple[Motion, ...] = (
     Motion.ZOOM_IN,
@@ -243,7 +373,7 @@ ROLE_CLAUSES: dict[SceneRole, str] = {
 PROMPT_TEMPLATE = """You are writing a short narrated corporate-training video about: {topic}
 
 Produce EXACTLY {slide_count} scenes. Return JSON matching the provided schema.
-
+{language_block}
 The register throughout is corporate training: concrete, actionable, specific. Say "check
 the sender domain", never "be careful". Name the thing, name the action.
 
@@ -296,7 +426,7 @@ glyph itself, so any character you add appears twice on screen.
     narration for the bullet's wording. A bullet that paraphrases instead of quoting has
     nothing to match and will be mistimed. So if the narration says "hover over the link
     to reveal the real destination", the bullet is "Hover Over The Link" or "Reveal The
-    Real Destination" — not "Link Safety".
+    Real Destination" — not "Link Safety".{anchor_note}
 
     List the bullets in the SAME ORDER the narration mentions them, first to last. Write
     each narration so it naturally contains that scene's number of quotable phrases, spread
@@ -304,7 +434,7 @@ glyph itself, so any character you add appears twice on screen.
     is revealed as its own phrase is spoken, so the narration needs room for that many
     separate moments. This applies to the recap and the ending as much as to the body.
 
-image_prompt — describe ONE photographic or cinematic BACKGROUND image for this scene.
+image_prompt —{visual_en} describe ONE photographic or cinematic BACKGROUND image for this scene.
 Name the subject, the setting, the lens or framing, the lighting, and the mood. It must
 be a real-looking photograph, not an illustration, diagram, chart, or infographic.
 
@@ -324,7 +454,7 @@ image_prompt with this exact sentence: "No text, no letters, no words, no number
 labels, no signage, no watermarks anywhere in the image." Image models render lettering
 as garbled nonsense, so any request for readable text ruins the frame.
 
-clip_prompt — the SAME shot as image_prompt, described as MOTION instead of composition,
+clip_prompt —{visual_en} the SAME shot as image_prompt, described as MOTION instead of composition,
 for a video model that will animate this scene. One or two sentences, present tense. Name
 the camera move (slow push in, handheld follow, tilt up, orbit left, locked-off static) and
 name what physically happens in frame (a hand reaching for the handset, a cursor sliding
@@ -343,7 +473,7 @@ continuous story with no repeated facts between them.
 Before you answer, check every scene against the STRUCTURE list one more time: its role,
 its bullet count, and above all its narration word count. A scene that overruns its word
 budget makes the finished video the wrong shape, and that is the single most common way
-this task is failed."""
+this task is failed.{language_reminder}"""
 
 
 class GeminiScriptProvider:
@@ -375,6 +505,7 @@ class GeminiScriptProvider:
         *,
         bullets_per_slide: int = BULLET_DEFAULT,
         tone: str | None = None,
+        language: Language = Language.EN,
     ) -> Script:
         """See `ScriptProvider.generate`.
 
@@ -384,10 +515,19 @@ class GeminiScriptProvider:
         the prompt and are re-imposed on the way back, so the returned scenes are correctly
         shaped even when the model miscounts. `tone` selects an audience clause; an
         unrecognised value is ignored.
+
+        `language` decides what the VIEWER reads and hears — narration, heading and bullets
+        are written natively in it, while `image_prompt` and `clip_prompt` stay English for
+        the English-conditioned image and video models. It also rescales every word budget by
+        the language's measured speaking rate, so the scene still lands inside its role's
+        duration window instead of inside English's word count. Keyword-only with a default,
+        so `ScriptProvider` conformance and every existing caller are unaffected; an
+        unrecognised value degrades to English rather than failing the job.
         """
         if slide_count < 1:
             raise ValueError("slide_count must be at least 1")
 
+        language = coerce_language(language)
         bullet_count = _bullet_target(bullets_per_slide)
 
         generation_config: dict[str, Any] = {
@@ -407,6 +547,7 @@ class GeminiScriptProvider:
                                 slide_count=slide_count,
                                 bullet_count=bullet_count,
                                 tone=tone,
+                                language=language,
                             )
                         }
                     ]
@@ -430,11 +571,13 @@ class GeminiScriptProvider:
                     id=int(item.get("id") or index + 1),
                     role=_coerce_role(item.get("role")),
                     narration=narration,
-                    heading=_clean_heading(str(item.get("heading", ""))),
+                    heading=_clean_heading(str(item.get("heading", "")), language),
                     # Cleaned against the CONTENT budget here and re-cut to the role's own
                     # budget in `_apply_roles`: the role a scene ends up with depends on its
                     # final position, which `_fit_scene_count` may still change.
-                    bullets=_clean_bullets(item.get("bullets"), narration, bullet_count),
+                    bullets=_clean_bullets(
+                        item.get("bullets"), narration, bullet_count, language=language
+                    ),
                     image_prompt=str(item.get("image_prompt", "")).strip(),
                     clip_prompt=_clean_narration(str(item.get("clip_prompt", ""))) or None,
                     motion=_coerce_motion(item.get("motion"), index),
@@ -443,12 +586,12 @@ class GeminiScriptProvider:
         if not scenes:
             raise GeminiError("model returned zero scenes")
 
-        scenes = _fit_scene_count(scenes, slide_count, bullet_count)
+        scenes = _fit_scene_count(scenes, slide_count, bullet_count, language)
         scenes = _renumber(scenes)
         scenes = _vary_motion(scenes)
-        scenes = _apply_roles(scenes, bullet_count)
+        scenes = _apply_roles(scenes, bullet_count, language)
 
-        title = _clean_heading(str(payload.get("title") or topic)) or topic.strip()
+        title = _clean_heading(str(payload.get("title") or topic), language) or topic.strip()
         return Script(topic=topic.strip(), title=title, scenes=scenes)
 
 
@@ -487,14 +630,24 @@ class VerbatimScriptProvider:
         *,
         bullets_per_slide: int = BULLET_DEFAULT,
         tone: str | None = None,
+        language: Language = Language.EN,
     ) -> Script:
         """See `ScriptProvider.generate`. `tone` is accepted and ignored — see the class
         docstring for why; `bullets_per_slide` sets how many fragments each segment yields,
         subject to there being enough source text to cut without producing scraps.
+
+        `language` is accepted and used, but ONLY for typography and tokenisation — it names
+        what script the user's own text is already in, and never causes a single word of it to
+        change. So a pasted Hindi script gets its sentences split on the danda instead of on a
+        full stop that is not there, its headings picked using Hindi function words rather
+        than English ones, and its bullets stripped of a trailing danda; the words themselves
+        stay exactly as written. Passing `Language.HI` here does NOT translate English text —
+        that would break the one promise this provider makes.
         """
         if slide_count < 1:
             raise ValueError("slide_count must be at least 1")
 
+        language = coerce_language(language)
         bullet_count = _bullet_target(bullets_per_slide)
         segments = _split_into_segments(self.script_text, slide_count)
         if len(segments) < slide_count:
@@ -507,15 +660,21 @@ class VerbatimScriptProvider:
                 id=index + 1,
                 role=SceneRole.CONTENT,
                 narration=segment,
-                heading=_heading_from(segment, fallback=f"Part {index + 1}"),
-                bullets=_bullets_from(segment, bullet_count),
-                image_prompt=_image_prompt_from(segment, topic),
-                clip_prompt=_clip_prompt_from(segment, topic),
+                heading=_heading_from(
+                    segment, fallback=f"Part {index + 1}", language=language
+                ),
+                bullets=_bullets_from(segment, bullet_count, language),
+                # English regardless of `language`: these condition the image and video
+                # models, and are never read or heard by a viewer.
+                image_prompt=_image_prompt_from(segment, topic, language),
+                clip_prompt=_clip_prompt_from(segment, topic, language),
                 motion=MOTION_CYCLE[index % len(MOTION_CYCLE)],
             )
             for index, segment in enumerate(segments)
         ]
-        title = (self.title or _heading_from(self.script_text, fallback=topic)).strip()
+        title = (
+            self.title or _heading_from(self.script_text, fallback=topic, language=language)
+        ).strip()
         return Script(topic=topic.strip(), title=title or topic.strip(), scenes=scenes)
 
 
@@ -525,7 +684,10 @@ _MARKDOWN = re.compile(r"[*_`#>\[\]]|~~")
 _EMOJI = re.compile(
     "[\U0001f300-\U0001faff\U00002600-\U000027bf\U0001f1e6-\U0001f1ff️]"
 )
-_SENTENCE_END = re.compile(r"(?<=[.!?])[\"')\]]*\s+")
+# The danda is in the class alongside ".!?" because it IS the Hindi full stop: without it a
+# whole Devanagari narration is one unsplittable sentence, and every path here that works by
+# cutting on sentence boundaries — segment splitting, fallback bullets — silently gives up.
+_SENTENCE_END = re.compile(r"(?<=[.!?।॥])[\"'’)\]]*\s+")
 _CLAUSE = re.compile(r"(?<=[,;:])\s+")
 # Leading list decoration the renderer draws itself: "- ", "1. ", "•", "a)".
 _BULLET_GLYPH = re.compile(r"^(?:[-•·–—+]+|\d+[.)]|[A-Za-z][.)])\s*")
@@ -538,6 +700,68 @@ _STOPWORDS = frozenset(
     just do does did done have has had also into over under about after before while
     because through during above below up down out off again once""".split()
 )
+
+# Function words per language, for the deterministic fallbacks (`_fragment_from`,
+# `_heading_from`) that pick a scene's own content words when the model under-delivers.
+# English stopwords applied to Spanish would treat "el dominio del remitente" as four content
+# words and open a bullet on "el", which reads as a template artefact in any language.
+_STOPWORDS_BY_LANGUAGE: dict[Language, frozenset[str]] = {
+    Language.EN: _STOPWORDS,
+    Language.ES: frozenset(
+        """el la los las un una unos unas lo al del de a en y o u pero que se su sus
+        es son era eran ser sido estar esta este esto estos estas ese esa eso esos esas
+        aquel aquella con por para sin sobre entre desde hasta como cuando donde porque
+        si no ni ya muy mas más menos todo toda todos todas otro otra cada mismo misma
+        yo tu tú él ella usted ustedes nosotros nosotras ellos ellas me te le les nos
+        mi mis nuestro nuestra vuestro su hay ha han he has hemos habia había puede
+        pueden debe deben tiene tienen tener hacer haga hagan""".split()
+    ),
+    Language.HI: frozenset(
+        """का के की को से में पर और या तो ही भी है हैं था थे थी हूँ हो होता होती होते
+        होना करना करें कर किया किए गई गए गया जाता जाती जाते यह वह ये वे इस उस इन उन
+        जो कि अगर तब जब कहाँ क्या कौन कैसे क्यों नहीं ना न एक कोई सब सभी अपना अपनी अपने
+        मैं मुझे मेरा हम हमें हमारा आप आपका आपको आपके आपकी वो उसका उसके उसकी लिए साथ
+        तक बाद पहले फिर ओर वाला वाले वाली रहा रहे रही सकता सकते सकती चाहिए""".split()
+    ),
+}
+
+# Characters that hold a word together: letters, digits, COMBINING MARKS, and the internal
+# apostrophe or hyphen the old ASCII pattern allowed.
+#
+# The mark category is the whole point and the easy thing to get wrong. Python's `\w` covers
+# Unicode categories L* and N* but NOT Mn/Mc — and Devanagari vowel signs, the anusvara and
+# the nukta are all marks. So a `[^\W_]+` "Unicode-aware" pattern silently DROPS them:
+# "जांचें" comes back as "जच", which is the same corruption `Language.needs_shaping` warns
+# about, just at the tokeniser instead of the renderer. Categories are tested directly
+# instead, which needs no per-script character ranges and cannot miss one.
+_WORD_MARKS = frozenset("'’-")
+
+
+def _words(text: str) -> list[str]:
+    """Word tokens of `text`, Unicode-aware and mark-preserving.
+
+    Replaces `re.findall(r"[A-Za-z0-9'-]+", ...)`, which was ASCII-only: it cut "protección"
+    into "protecci" + "n" and matched NOTHING at all in Devanagari, so every deterministic
+    fallback in this file returned an empty list for Hindi. Byte-identical to the old pattern
+    on ASCII input — verified by differential test — while admitting accents, eñes, and
+    Devanagari consonants with their matras and nuktas attached.
+    """
+    tokens: list[str] = []
+    current: list[str] = []
+    for char in text:
+        if char in _WORD_MARKS or unicodedata.category(char)[0] in {"L", "N", "M"}:
+            current.append(char)
+        elif current:
+            tokens.append("".join(current))
+            current = []
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
+# Devanagari sentence terminator. A Hindi heading must not end in one, and a Hindi sentence
+# must not end in a full stop — imposing "." on Devanagari is a visible defect, not a nit.
+DANDA = "।"
+DOUBLE_DANDA = "॥"
 
 
 def _bullet_target(bullets_per_slide: Any) -> int:
@@ -577,20 +801,92 @@ def role_bullet_target(role: SceneRole, bullets_per_slide: Any = BULLET_DEFAULT)
     return max(0, min(_bullet_target(bullets_per_slide), role.bullet_budget))
 
 
-def narration_words(role: SceneRole) -> tuple[int, int, int]:
+def coerce_language(value: Any) -> Language:
+    """Read a language from an enum, a code, or junk. Never raises — English is the floor.
+
+    The API layer will hand this whatever arrives in a request body, and a bad language code
+    is not worth failing a job over when the alternative is a perfectly good English script.
+    """
+    if isinstance(value, Language):
+        return value
+    if isinstance(value, str):
+        try:
+            return Language(value.strip().lower())
+        except ValueError:
+            logger.info("unknown language %r; writing in English", value)
+    return Language.EN
+
+
+def language_word_factor(language: Language = Language.EN) -> float:
+    """Multiplier on the English word budgets for `language`. See `LANGUAGE_WORD_FACTOR`."""
+    return LANGUAGE_WORD_FACTOR.get(language, 1.0)
+
+
+def language_wpm(language: Language = Language.EN) -> float:
+    """Planning pace for `language`: the rate at which its scaled budget hits the role window.
+
+    Anchored on the English spec rate rather than on `MEASURED_WPM[EN]`, so English stays
+    exactly 135 wpm and every other language is expressed relative to it.
+    """
+    return WORDS_PER_MINUTE * language_word_factor(language)
+
+
+def narration_words(role: SceneRole, language: Language = Language.EN) -> tuple[int, int, int]:
     """(min, target, max) narration words for `role`. Audio is the clock, so this is the
     only lever the script has on how long a scene lasts.
+
+    Scaled by `language`, because the budget is a duration: the same 11-19s content window
+    buys 25-43 English words but 35-61 Spanish ones. `language` is positional-with-default so
+    every existing caller — and every published number in `docs/DIRECTION.md` §1.2 — is
+    untouched.
 
     Notably it does NOT vary with `bullets_per_slide`. A content scene is 11-19s whatever it
     carries, so its word budget is fixed; asking for one fewer point buys a slower reveal,
     not a shorter scene.
     """
-    return ROLE_NARRATION_WORDS[role]
+    low, target, high = ROLE_NARRATION_WORDS[role]
+    factor = language_word_factor(language)
+    if factor == 1.0:
+        return low, target, high
+    # Rounded independently then re-ordered: rounding three numbers can in principle
+    # collapse or invert the range, and a min above its max would be sent to the model.
+    scaled = sorted(max(1, round(value * factor)) for value in (low, target, high))
+    return scaled[0], scaled[1], scaled[2]
 
 
-def words_spoken_in(seconds: float) -> float:
-    """Words a narrator gets through in `seconds`, at the spec pace."""
-    return seconds * WORDS_PER_MINUTE / 60.0
+def words_spoken_in(seconds: float, language: Language = Language.EN) -> float:
+    """Words a narrator gets through in `seconds`, at `language`'s planning pace."""
+    return seconds * language_wpm(language) / 60.0
+
+
+def anchoring_supported(language: Language) -> bool:
+    """Whether the verbatim-anchor invariant can hold for `language` AT ALL.
+
+    PROBED, not declared. `bullet_timing` reaches a bullet's anchor through
+    `deepgram_align.normalize`, which keeps only `[a-z0-9]`; a script whose characters all
+    fall outside that range normalises to nothing, so no bullet in it can ever match its own
+    narration. Rather than hardcode "Hindi cannot anchor" — which would be a lie the day
+    `normalize` is widened to Unicode — this asks the real matcher a question it cannot get
+    wrong: does a phrase lifted verbatim out of a sample find itself?
+
+    False means bullet reveals fall back to proportional placement for that language. It is a
+    product constraint to be reported, not a condition this file can repair: the fix lives in
+    `deepgram_align.normalize`, which this provider only consumes.
+    """
+    sample = _ANCHOR_PROBE.get(language)
+    if sample is None:
+        return True
+    narration, bullet = sample
+    return anchor_position(bullet, narration) is not None
+
+
+# One (narration, bullet) pair per language where the bullet is a verbatim run of the
+# narration. If the matcher cannot find it, nothing in that script will ever anchor.
+_ANCHOR_PROBE: dict[Language, tuple[str, str]] = {
+    Language.EN: ("Hover over the link to reveal the real destination.", "reveal the real"),
+    Language.ES: ("Verifique el dominio del remitente con atención.", "dominio del remitente"),
+    Language.HI: ("भेजने वाले का डोमेन ध्यान से जांचें।", "वाले का डोमेन"),
+}
 
 
 def role_plan(slide_count: int) -> list[SceneRole]:
@@ -628,7 +924,9 @@ def _coerce_role(value: Any) -> SceneRole:
     return SceneRole.CONTENT
 
 
-def _apply_roles(scenes: list[SceneScript], bullet_count: int) -> list[SceneScript]:
+def _apply_roles(
+    scenes: list[SceneScript], bullet_count: int, language: Language = Language.EN
+) -> list[SceneScript]:
     """Impose `role_plan` by position and re-cut each scene's bullets to its role's budget.
 
     Runs last, after `_fit_scene_count` has settled how many scenes there are: a scene's
@@ -652,7 +950,7 @@ def _apply_roles(scenes: list[SceneScript], bullet_count: int) -> list[SceneScri
             # TRIM, not re-derive. The parse pass already topped this scene up and may have
             # deliberately kept an unanchored point to avoid an empty-looking panel; a
             # second full clean would discard exactly that point and end up one short.
-            bullets = _clean_bullets(bullets, scene.narration, target)
+            bullets = _clean_bullets(bullets, scene.narration, target, language=language)
         result.append(
             _as_structured(scene).model_copy(update={"role": role, "bullets": bullets})
         )
@@ -679,17 +977,82 @@ def _tone_clause(tone: str | None) -> str:
     return f"\n{clause}\n" if clause else ""
 
 
-def _structure_block(plan: list[SceneRole], bullet_count: int) -> str:
+def _language_block(language: Language) -> str:
+    """The LANGUAGE paragraph, or "" for English.
+
+    English injects NOTHING — the prompt for an English script is byte-identical to the one
+    that existed before languages did. That is not tidiness, it is how the measured English
+    result (22/22 bullets anchored, 0 fallbacks) is guaranteed not to move: there is no new
+    text in the English prompt to move it.
+    """
+    if language is Language.EN:
+        return ""
+    name = LANGUAGE_NAMES[language]
+    conventions = LANGUAGE_CLAUSES.get(language, "").strip()
+    block = f"""
+LANGUAGE — write this video in {name}.
+
+Everything the VIEWER reads or hears is in {name}: the video's title, and every scene's
+heading, every bullet and every word of narration. Compose it NATIVELY — think in the
+language and write in it directly. Do NOT draft in English and translate: a translated
+script scans as translated the moment it is read aloud, and its bullets stop quoting the
+narration they are supposed to be lifted from, which breaks the on-screen timing.
+
+ONE EXCEPTION, and only this one: image_prompt and clip_prompt stay in ENGLISH. No viewer
+ever sees them — they are conditioning text for image and video models trained on English
+captions, so writing them in {name} produces a worse frame and buys nothing at all. Every
+other field is {name}; those two are English.
+"""
+    return f"{block}\n{conventions}\n" if conventions else block
+
+
+def _language_reminder(language: Language) -> str:
+    """Final-position language check. Empty for English, which needs no reminder."""
+    if language is Language.EN:
+        return ""
+    name = LANGUAGE_NAMES[language]
+    return (
+        f"\n\nCheck the language too: narration, heading and bullets in {name} on every "
+        f"single scene, with image_prompt and clip_prompt in English on every single scene. "
+        f"A script half in English is worse than either language alone."
+    )
+
+
+def _anchor_note(language: Language) -> str:
+    """The inflection qualifier on the anchor rule. Empty for English."""
+    note = LANGUAGE_ANCHOR_NOTES.get(language, "").strip("\n").rstrip()
+    return f"\n\n{note}" if note else ""
+
+
+def _visual_english(language: Language) -> str:
+    """The "this field stays English" flag, injected AT the two visual-prompt fields.
+
+    Empty for English — where saying "in English" would be noise — and stated at the field
+    rather than only in the LANGUAGE block up top, because that is where the model is
+    actually deciding what to write and a rule six paragraphs away loses to the surrounding
+    Spanish or Hindi.
+    """
+    if language is Language.EN:
+        return ""
+    return " IN ENGLISH, not in the language of the narration —"
+
+
+def _structure_block(
+    plan: list[SceneRole], bullet_count: int, language: Language = Language.EN
+) -> str:
     """The scene-by-scene contract sent to the model: role, word budget, point count.
 
     Spelled out per scene rather than described in general terms. A model given "the first
     scene should be short" writes a nineteen-second opener; a model given "scene 1 — role:
     title — narration 7-14 words — 0 bullets" writes a title card.
+
+    The word budgets are `language`'s, not English's — this is the one place the per-language
+    factor actually reaches the model, so a Spanish scene is asked for Spanish-many words.
     """
     lines = []
     for index, role in enumerate(plan, start=1):
         bullets = role_bullet_target(role, bullet_count)
-        low, target, high = narration_words(role)
+        low, target, high = narration_words(role, language)
         plural = "" if bullets == 1 else "s"
         lines.append(
             f"  scene {index} — role: {role.value} — narration {target} words "
@@ -715,8 +1078,19 @@ def _role_clauses(plan: list[SceneRole], bullet_count: int) -> str:
     return "\n\n".join(clauses) + "\n"
 
 
-def _build_prompt(*, topic: str, slide_count: int, bullet_count: int, tone: str | None) -> str:
-    """Fill the template. The per-scene structure block carries the pacing contract."""
+def _build_prompt(
+    *,
+    topic: str,
+    slide_count: int,
+    bullet_count: int,
+    tone: str | None,
+    language: Language = Language.EN,
+) -> str:
+    """Fill the template. The per-scene structure block carries the pacing contract.
+
+    For `Language.EN` every language-derived placeholder is empty and `wpm` is the spec's
+    135, so the English prompt is byte-identical to the pre-language one.
+    """
     plan = role_plan(slide_count)
     return PROMPT_TEMPLATE.format(
         topic=topic,
@@ -726,10 +1100,14 @@ def _build_prompt(*, topic: str, slide_count: int, bullet_count: int, tone: str 
         heading_chars=HEADING_CHAR_MAX,
         bullet_chars=BULLET_CHAR_MAX,
         title_chars=TITLE_CHAR_MAX,
-        wpm=int(WORDS_PER_MINUTE),
-        structure_block=_structure_block(plan, bullet_count),
+        wpm=int(language_wpm(language)),
+        structure_block=_structure_block(plan, bullet_count, language),
         role_clauses=_role_clauses(plan, bullet_count),
         tone_clause=_tone_clause(tone),
+        language_block=_language_block(language),
+        language_reminder=_language_reminder(language),
+        anchor_note=_anchor_note(language),
+        visual_en=_visual_english(language),
     )
 
 
@@ -739,10 +1117,18 @@ def _clean_narration(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
-def _clean_heading(text: str) -> str:
+def _clean_heading(text: str, language: Language = Language.EN) -> str:
+    """One-line on-screen title: no markup, no terminal punctuation.
+
+    The strip set is the language's own. A Devanagari heading ending in a danda needs the
+    danda removed for exactly the reason an English one needs the full stop removed, and a
+    Spanish heading keeps a leading "¿" or "¡" because only the TRAILING end is stripped —
+    an opened question that never closes would be worse than the terminal mark.
+    """
     text = _EMOJI.sub("", _MARKDOWN.sub("", text))
     text = re.sub(r"\s+", " ", text).strip()
-    return text.rstrip(".:;,- ").strip()
+    strip = f".:;,-{DANDA}{DOUBLE_DANDA} " if language is Language.HI else ".:;,- "
+    return text.rstrip(strip).strip()
 
 
 def _coerce_motion(value: Any, index: int) -> Motion:
@@ -758,7 +1144,10 @@ def _coerce_motion(value: Any, index: int) -> Motion:
 
 
 def _fit_scene_count(
-    scenes: list[SceneScript], slide_count: int, bullet_count: int = BULLET_DEFAULT
+    scenes: list[SceneScript],
+    slide_count: int,
+    bullet_count: int = BULLET_DEFAULT,
+    language: Language = Language.EN,
 ) -> list[SceneScript]:
     """Guarantee the caller's slide_count even if the model miscounted.
 
@@ -779,14 +1168,18 @@ def _fit_scene_count(
             continue
         # A bullet must stay with the half of the narration that actually says it,
         # otherwise its anchor phrase is in the other scene and it cannot be timed.
-        head, tail = _partition_bullets(victim.bullets, halves[0], halves[1], bullet_count)
+        head, tail = _partition_bullets(
+            victim.bullets, halves[0], halves[1], bullet_count, language
+        )
         scenes[target] = victim.model_copy(update={"narration": halves[0], "bullets": head})
         scenes.insert(
             target + 1,
             victim.model_copy(
                 update={
                     "narration": halves[1],
-                    "heading": _heading_from(halves[1], fallback=victim.heading),
+                    "heading": _heading_from(
+                        halves[1], fallback=victim.heading, language=language
+                    ),
                     "bullets": tail,
                 }
             ),
@@ -874,7 +1267,13 @@ def _ensure_units(units: list[str], count: int) -> list[str]:
     return units
 
 
-def _clean_bullets(raw: Any, narration: str, target: int = BULLET_DEFAULT) -> list[str]:
+def _clean_bullets(
+    raw: Any,
+    narration: str,
+    target: int = BULLET_DEFAULT,
+    *,
+    language: Language = Language.EN,
+) -> list[str]:
     """Normalise the model's bullets, then guarantee `target` of them where possible.
 
     `target` is the caller's `bullets_per_slide`, already clamped. It is enforced on the
@@ -897,6 +1296,15 @@ def _clean_bullets(raw: Any, narration: str, target: int = BULLET_DEFAULT) -> li
     `target` is honoured EXACTLY rather than clamped into the 3-5 legible range, because it
     is now role-derived: a title card's zero and a closing's two are deliberate, and
     rounding them up to three is the "every scene looks the same" defect.
+
+    LANGUAGE, and this is the subtle part: the anchoring and ordering defences BOTH depend on
+    `anchor_position`, which cannot see a script `deepgram_align.normalize` reduces to nothing
+    (Devanagari, today). In such a language every bullet looks unanchored, so applying the
+    defences unchanged would demote every bullet the model wrote in favour of a mechanically
+    sliced fragment — on the strength of a test that returned "no" to every question it was
+    asked. When the check cannot run, it is not consulted: the model's own bullets are kept,
+    in the model's own order, which is the best available guess at spoken order. That is a
+    degradation to be reported, but a much smaller one than shredding good copy.
     """
     target = _exact_bullet_target(target)
     if target == 0:
@@ -905,16 +1313,26 @@ def _clean_bullets(raw: Any, narration: str, target: int = BULLET_DEFAULT) -> li
     cleaned: list[str] = []
     seen: set[str] = set()
     for value in values:
-        text = _clean_bullet(str(value))
+        text = _clean_bullet(str(value), language)
         if not text or text.lower() in seen:
             continue
         seen.add(text.lower())
         cleaned.append(text)
 
+    if not anchoring_supported(language):
+        bullets = cleaned[:target]
+        for candidate in _bullets_from(narration, target, language):
+            if len(bullets) >= target:
+                break
+            if _is_redundant(candidate, bullets):
+                continue
+            bullets.append(candidate)
+        return bullets
+
     bullets = [b for b in cleaned if anchor_position(b, narration) is not None][:target]
     spare = [b for b in cleaned if b not in bullets]
 
-    for source in (_bullets_from(narration, target), spare):
+    for source in (_bullets_from(narration, target, language), spare):
         for candidate in source:
             if len(bullets) >= target:
                 break
@@ -925,12 +1343,17 @@ def _clean_bullets(raw: Any, narration: str, target: int = BULLET_DEFAULT) -> li
     return _order_by_narration(bullets, narration)
 
 
-def _clean_bullet(text: str) -> str:
-    """One on-screen fragment: no markdown, no glyph, no terminal punctuation."""
+def _clean_bullet(text: str, language: Language = Language.EN) -> str:
+    """One on-screen fragment: no markdown, no glyph, no terminal punctuation.
+
+    Only the trailing end is stripped, which is what lets a Spanish fragment keep an opening
+    "¿"/"¡" while still losing a trailing "." — and lets a Hindi fragment lose its danda.
+    """
     text = _EMOJI.sub("", _MARKDOWN.sub("", text))
     text = re.sub(r"\s+", " ", text).strip()
     text = _BULLET_GLYPH.sub("", text).strip()
-    return text.rstrip(".,;:!?-– ").strip()
+    strip = f".,;:!?-– {DANDA}{DOUBLE_DANDA}" if language is Language.HI else ".,;:!?-– "
+    return text.rstrip(strip).strip()
 
 
 def _order_by_narration(bullets: list[str], narration: str) -> list[str]:
@@ -947,7 +1370,9 @@ def _order_by_narration(bullets: list[str], narration: str) -> list[str]:
     return [bullets[index] for _, index in sorted(ranked)]
 
 
-def _bullets_from(text: str, target: int = BULLET_DEFAULT) -> list[str]:
+def _bullets_from(
+    text: str, target: int = BULLET_DEFAULT, language: Language = Language.EN
+) -> list[str]:
     """Derive up to `target` on-screen points from the text that will be narrated.
 
     Every fragment is a contiguous run of the source's own words, so the anchor the timer
@@ -976,7 +1401,7 @@ def _bullets_from(text: str, target: int = BULLET_DEFAULT) -> list[str]:
 
     bullets: list[str] = []
     for unit in units:
-        fragment = _fragment_from(unit)
+        fragment = _fragment_from(unit, language)
         if not fragment or len(fragment.split()) < BULLET_WORD_MIN:
             continue
         if _is_redundant(fragment, bullets):
@@ -995,25 +1420,32 @@ def _is_redundant(candidate: str, bullets: list[str]) -> bool:
     return any(key in b.lower() or b.lower() in key for b in bullets)
 
 
-def _fragment_from(unit: str) -> str:
+def _fragment_from(unit: str, language: Language = Language.EN) -> str:
     """A 2-6 word verbatim run of `unit`, starting at its first content word.
 
     Sentence case, per `docs/DIRECTION.md` §2.2: a mechanically Title-Cased bullet reads as
     a template artefact, and the capitalised articles are the giveaway. Acronyms keep their
     own casing, and the run is trimmed to `BULLET_CHAR_MAX` words-first so it still fits on
     one line.
+
+    `language` picks the stopword set, so a Spanish fragment opens on "dominio" rather than
+    on "el", and Devanagari — which has no case at all — is left uncased rather than being
+    put through a capitalisation rule borrowed from English.
     """
-    words = re.findall(r"[A-Za-z0-9'-]+", unit)
+    words = _words(unit)
     if not words:
         return ""
-    start = next((i for i, w in enumerate(words) if w.lower() not in _STOPWORDS), 0)
+    stopwords = _STOPWORDS_BY_LANGUAGE.get(language, _STOPWORDS)
+    start = next((i for i, w in enumerate(words) if w.lower() not in stopwords), 0)
     run = words[start : start + BULLET_WORD_MAX]
-    while len(run) > BULLET_WORD_MIN and run[-1].lower() in _STOPWORDS:
+    while len(run) > BULLET_WORD_MIN and run[-1].lower() in stopwords:
         run.pop()
     if len(run) < BULLET_WORD_MIN:
         run = words[-BULLET_WORD_MIN:]
     while len(run) > BULLET_WORD_MIN and len(" ".join(run)) > BULLET_CHAR_MAX:
         run.pop()
+    if language.script != "latin":
+        return " ".join(run)
     return _sentence_case(run)
 
 
@@ -1030,9 +1462,26 @@ def _sentence_case(words: list[str]) -> str:
 
 
 def _partition_bullets(
-    bullets: list[str], first: str, second: str, target: int = BULLET_DEFAULT
+    bullets: list[str],
+    first: str,
+    second: str,
+    target: int = BULLET_DEFAULT,
+    language: Language = Language.EN,
 ) -> tuple[list[str], list[str]]:
-    """Split one scene's bullets across the two halves of its narration."""
+    """Split one scene's bullets across the two halves of its narration.
+
+    Normally each bullet goes to the half that actually says it. Where the anchor check
+    cannot run at all, asking "which half says this?" returns "neither" for every bullet and
+    the whole set would be discarded, so the split falls back to position: the bullets were
+    written in spoken order, so the front ones belong to the front half.
+    """
+    if not anchoring_supported(language):
+        middle = len(bullets) // 2
+        return (
+            _clean_bullets(bullets[:middle], first, target, language=language),
+            _clean_bullets(bullets[middle:], second, target, language=language),
+        )
+
     head: list[str] = []
     tail: list[str] = []
     for bullet in bullets:
@@ -1041,23 +1490,34 @@ def _partition_bullets(
         elif anchor_position(bullet, second) is not None:
             tail.append(bullet)
         # Anchored in neither half: dropped, and both halves are topped up below.
-    return _clean_bullets(head, first, target), _clean_bullets(tail, second, target)
+    return (
+        _clean_bullets(head, first, target, language=language),
+        _clean_bullets(tail, second, target, language=language),
+    )
 
 
-def _heading_from(text: str, *, fallback: str) -> str:
+def _heading_from(text: str, *, fallback: str, language: Language = Language.EN) -> str:
     """Deterministic 3-7 word title from the segment's own opening words."""
-    words = re.findall(r"[A-Za-z0-9'-]+", text)
+    words = _words(text)
     if not words:
-        return _clean_heading(fallback)
-    keywords = [w for w in words if w.lower() not in _STOPWORDS]
+        return _clean_heading(fallback, language)
+    stopwords = _STOPWORDS_BY_LANGUAGE.get(language, _STOPWORDS)
+    keywords = [w for w in words if w.lower() not in stopwords]
     chosen = (keywords or words)[:6]
     if len(chosen) < 3:
         chosen = words[:5]
-    heading = " ".join(w if w.isupper() else w.capitalize() for w in chosen)
-    return _clean_heading(heading) or _clean_heading(fallback)
+    if language.script == "latin":
+        heading = " ".join(w if w.isupper() else w.capitalize() for w in chosen)
+    else:
+        # Devanagari is unicameral: `.capitalize()` is a no-op on it, so calling it would
+        # only imply a casing rule that does not exist for this script.
+        heading = " ".join(chosen)
+    return _clean_heading(heading, language) or _clean_heading(fallback, language)
 
 
-def _clip_prompt_from(segment: str, topic: str) -> str:
+def _clip_prompt_from(
+    segment: str, topic: str, language: Language = Language.EN
+) -> str:
     """Motion counterpart to `_image_prompt_from`, for a video model.
 
     Deliberately generic about the *action* — there is no LLM here to invent one, and a
@@ -1065,7 +1525,8 @@ def _clip_prompt_from(segment: str, topic: str) -> str:
     which is the part `image_prompt` cannot express at all.
     """
     return (
-        f"Slow steady push in on a real scene showing {_clip_subject(segment, topic)}. "
+        "Slow steady push in on a real scene showing "
+        f"{_clip_subject(segment, topic, language)}. "
         "Live-action documentary footage, natural light, shallow depth of field, subject "
         "moving gently within the frame, handheld micro-motion, no cuts, no camera flash, "
         "no on-screen speaker, no dialogue. No text, no letters, no words, no numbers, no "
@@ -1073,16 +1534,29 @@ def _clip_prompt_from(segment: str, topic: str) -> str:
     )
 
 
-def _clip_subject(segment: str, topic: str) -> str:
-    """The segment's own content words, as a subject phrase for either visual prompt."""
-    words = re.findall(r"[A-Za-z0-9'-]+", segment)
-    keywords = [w.lower() for w in words if w.lower() not in _STOPWORDS][:10]
+def _clip_subject(segment: str, topic: str, language: Language = Language.EN) -> str:
+    """The segment's own content words, as a subject phrase for either visual prompt.
+
+    Both visual prompts are English, and there is no translator on this path — so for a
+    non-Latin script the segment's words cannot go into one. Devanagari keywords in an
+    English image prompt are worse than no keywords: the model is English-conditioned, so
+    they contribute noise instead of subject matter, and the topic alone at least names the
+    right thing. Spanish keywords are kept — Latin script, and the image models read them.
+    """
+    stopwords = _STOPWORDS_BY_LANGUAGE.get(language, _STOPWORDS)
+    if language.script != "latin":
+        return topic.strip()
+    words = _words(segment)
+    keywords = [w.lower() for w in words if w.lower() not in stopwords][:10]
     return ", ".join(dict.fromkeys(keywords)) or topic.strip()
 
 
-def _image_prompt_from(segment: str, topic: str) -> str:
-    """Build a background-image prompt from the segment without calling an LLM."""
-    subject = _clip_subject(segment, topic)
+def _image_prompt_from(segment: str, topic: str, language: Language = Language.EN) -> str:
+    """Build a background-image prompt from the segment without calling an LLM.
+
+    Always English boilerplate — see `_clip_subject` for what happens to a non-Latin segment.
+    """
+    subject = _clip_subject(segment, topic, language)
     return (
         f"A cinematic documentary photograph illustrating {topic.strip()}: {subject}. "
         "Real photography, natural light, shallow depth of field, wide landscape framing, "

@@ -262,15 +262,23 @@ async def _stage_images(timeline: Timeline, job_dir: Path) -> None:
     await _gather_scenes("image generation", [one(s) for s in timeline.scenes])
 
 
-async def _stage_narrate(timeline: Timeline, job_dir: Path) -> None:
-    """All narration at once — each take is independent of the others."""
-    synth = factory.speech_synthesizer()
+async def _stage_narrate(timeline: Timeline, job_dir: Path, engine: str | None = None) -> None:
+    """All narration at once — each take is independent of the others.
+
+    SSML goes ONLY to an engine that declares it parses SSML. Deepgram Aura does not: it
+    vocalises the tags, so `<break time="800ms"/>` is spoken as "break time equals eight
+    hundred milliseconds" (measured). `getattr` with a False default rather than a direct
+    attribute read — absent must mean plain text, never "assume it copes".
+    """
+    synth = factory.speech_synthesizer(engine=engine)
+    send_ssml = getattr(synth, "supports_ssml", False)
     limit = asyncio.Semaphore(_api_concurrency())
 
     async def one(scene: Scene) -> None:
         out = job_dir / f"scene_{scene.id:02d}.mp3"
+        spoken = scene.ssml if (send_ssml and scene.ssml) else scene.narration
         async with limit:
-            path = await asyncio.to_thread(synth.synthesize, scene.narration, timeline.voice, out)
+            path = await asyncio.to_thread(synth.synthesize, spoken, timeline.voice, out)
         scene.audio_path = str(path)
 
     await _gather_scenes("narration", [one(s) for s in timeline.scenes])
@@ -469,7 +477,7 @@ async def run_job(job_id: str) -> None:
             await _stage_images(timeline, job_dir)
 
         async def audio_branch() -> None:
-            await _stage_narrate(timeline, job_dir)
+            await _stage_narrate(timeline, job_dir, engine=job.tts_engine)
             # Audio is the clock: scene start/end only become real here.
             await _set_stage(job_id, JobStatus.ALIGNING, timeline)
             await _stage_align(timeline)

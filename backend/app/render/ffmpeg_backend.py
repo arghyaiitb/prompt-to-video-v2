@@ -12,10 +12,15 @@ Four things in here are load-bearing and easy to get wrong:
 :func:`layout_region`). ``SlideLayout.FULL_BLEED`` is the exception, not the rule.
 
 *zoompan jitter.* ``zoompan`` truncates its ``x``/``y`` expressions to integers, so a
-slow pan advances 0px for several frames and then jumps 1px — a visible stutter. We
-pre-scale the source by ``profile.upscale_factor`` before zoompan and let zoompan
-downscale to the *region's* size, which turns that 1px step into 1/N of an output
-pixel. Ken Burns therefore happens inside the image panel, not across the frame.
+slow pan advances 0px for several frames and then jumps 1px — a visible stutter. The
+cure has two halves, and each fixes a different cause; see
+:func:`upscale_factors` and :func:`eased_progress`.
+
+*Generated clips.* A scene's visual may be a Veo clip rather than a still
+(``Scene.video_path``). It is fitted into the same region, converted to the timeline's
+fps, looped with a crossfade at the seam to cover a scene longer than the clip, and
+stripped of its own audio. No zoompan is applied on top of moving footage. See
+:meth:`FFmpegBackend._clip_chain`.
 
 *Text animation without drawtext.* This build has no ``drawtext`` (no libfreetype),
 so text arrives as pre-rasterised RGBA PNGs via :mod:`app.render.contracts`. Each
@@ -69,6 +74,109 @@ we switch to a blurred fill instead. Stretching is never an option."""
 MIN_PAN_ZOOM = 1.06
 """A pan needs headroom to travel across; at zoom 1.0 there is nowhere to go."""
 
+# ------------------------------------------------------- Ken Burns smoothness
+#
+# Two independent causes make a slow move step, and a fixed pre-upscale only ever
+# addressed the first one.
+#
+# 1. *Quantisation.* zoompan's x/y (and its crop size) are integers in **input canvas**
+#    pixels, so the finest move it can make is one canvas pixel, which lands on screen as
+#    ``zoom / U`` output pixels where ``U = canvas_width / region_width``. Pre-upscaling
+#    raises U. The factor was a fixed 4, calibrated when zoompan filled the frame
+#    (1920 wide); Ken Burns now runs inside the image region (``hero_right`` is 856x816),
+#    so a 4x canvas is 3424 wide instead of 7680 and the same move has less than half the
+#    headroom it was tuned for. :func:`upscale_factors` derives U from the region, the
+#    distance the move actually travels and the frame count instead.
+#
+# 2. *Easing.* ``ease_in_out`` was a pure smoothstep, whose velocity is **exactly zero**
+#    at both ends. The opening of every move was therefore genuinely stationary, and no
+#    finite upscale can fix a zero. :func:`eased_progress` keeps the smoothstep character
+#    but blends in enough linear ramp to guarantee a velocity floor. This is free, and on
+#    the measured cases it is the larger of the two effects.
+
+EASE_VELOCITY_FLOOR = 0.15
+"""Fraction of the mean rate that an ``ease_in_out`` move still travels at its slowest.
+
+0 is a pure smoothstep and is what shipped: velocity ``3u^2-2u^3`` differentiates to
+``6u(1-u)``, which is zero at both endpoints, so the first and last frames of every move
+held position no matter how much headroom zoompan was given. Blending in a linear ramp
+puts a floor under it. 0.15 keeps 85% of the smoothstep's character — a viewer cannot
+distinguish "starts at 15% speed" from "starts at 0% speed", but the artefact can:
+measured on ``hero_right``/``pan_right`` at 1080p over 604 frames, the duplicate-frame
+ratio in the evaluator's window fell from 11.67% to 2.50% from this change alone.
+"""
+
+CANVAS_STEP_TARGET = 1.0
+"""Canvas pixels the move must advance per frame at its **slowest** point.
+
+1.0 is not a tuning knob, it is the condition itself: zoompan truncates to whole canvas
+pixels, so a move that advances less than one of them per frame produces a byte-identical
+frame. Below this the render *will* step; above it, it cannot.
+
+An earlier draft of this used 0.35, fitted to the ``hero_right`` case where the anamorphic
+stretch is wide enough that a fractional shift still perturbs every output pixel a little.
+It does not generalise — on a small isotropic canvas the same 0.35 left 30% duplicates.
+The target is the physics; :data:`CANVAS_PIXEL_BUDGET` is where the compromise lives, and
+it is honest about being one.
+"""
+
+CANVAS_PIXEL_BUDGET = 24_000_000
+"""Per-frame resample budget for zoompan's canvas, in pixels, at ``upscale_factor=4``.
+
+The cost of a Ken Burns scene is dominated by zoompan cropping its canvas and lanczos-
+scaling that crop down to the region, once per output frame. So the thing to budget is
+canvas **area** — not the upscale factor, which says nothing about cost until you know how
+big the region is. A 16x factor on an 856-wide panel and a 16x factor on a 1920-wide frame
+differ by more than five times the work.
+
+24M pixels is the measured break-even: it is the size of the ``hero_right`` canvas
+(14552x1632) that rendered in 7.6s against the 7.7s the old fixed 4x canvas took, i.e. the
+fix pays for itself there. Scaled by ``RenderProfile.upscale_factor / 4``, so ``draft``
+buys half the smoothness for half the time and the field stays meaningful.
+
+Where the budget binds before :data:`CANVAS_STEP_TARGET` is satisfied — the slowest moves
+over the largest regions, ``full_bleed`` worst — some stepping survives by construction.
+The cure there is a larger zoom span or a shorter scene, both of which are the planner's,
+and :func:`slowest_step` is the number to argue with.
+"""
+
+UPSCALE_BUDGET_BASIS = 4
+"""The ``upscale_factor`` that :data:`CANVAS_PIXEL_BUDGET` was measured at."""
+
+MIN_TRAVEL_UPSCALE = 2
+"""Never run zoompan at canvas == region: a fast move needs little headroom, but zero
+headroom quantises it to whole output pixels for no saving worth having."""
+
+PAN_CROSS_UPSCALE = 2
+"""Cross-axis oversampling for a pan. A pan holds a fixed zoom, so the crop's size and
+its cross-axis offset never change and the axis needs resolution only for *detail*, not
+for positional precision. 2x supersampling of the output is ample."""
+
+ZOOM_CROSS_UPSCALE = 4
+"""Cross-axis oversampling for a zoom, which moves both axes and changes the crop's size.
+Measured: dropping a zoom's cross axis to 2 costs about half the gain (23.3% vs 15.8%),
+while raising it past 4 buys nothing (identical ratio at twice the render time)."""
+
+MAX_DETAIL_UPSCALE = 4
+MAX_SOURCE_UPSCALE = 1.25
+"""How far past its own resolution the source may be lanczos-upscaled before zoompan.
+
+This is the "source pixels vs region output size" half of the derivation. Fitting a
+2752x1536 still into an 856x816 panel already needs a 0.53x scale, so a 2x canvas is
+about the source's own resolution and a 4x canvas is inventing detail with a lanczos
+kernel and then throwing it away — measurably softer *and* slower. Detail therefore stops
+here; positional precision beyond it is bought with a cheap anamorphic stretch instead.
+"""
+
+STROBE_STEP_PIXELS = 3.0
+"""Peak output pixels per frame past which a move reads as strobing rather than moving.
+
+The opposite failure to stepping, and the reason the derived upscale has an upper clamp
+rather than being maximised: there is no point buying sub-pixel precision for a move that
+is already skipping three pixels a frame. Warned about, not corrected — the cure is a
+smaller zoom span or a longer scene, both of which are the planner's call.
+"""
+
 AUDIO_RATE = 48_000
 
 LOUDNESS_TARGET_LUFS = -16.0
@@ -85,6 +193,36 @@ LOUDNESS_TRUE_PEAK_DB = -1.0
 LOUDNESS_RANGE = 11.0
 """Target loudness range. Narration plus a ducked bed is not dynamic material; a wider
 target lets ``loudnorm`` leave quiet passages quiet and undoes the point of normalising."""
+
+# ------------------------------------------------------------ generated clips
+
+CLIP_SEAM_CROSSFADE = 0.5
+"""Crossfade, in seconds, hiding the seam where a generated clip loops.
+
+A Veo clip is a fixed 8.000s and a content scene runs 14-24s, so one clip cannot fill a
+scene and something has to cover the shortfall. Of the three candidates, measured:
+
+* *hold the final frame* — 12s of freeze on a 20s scene. 60% of the scene stops dead;
+  the duplicate-frame ratio goes to ~60% and it reads as a hung player.
+* *slow the clip down* — 2.5x on ``setpts`` turns 24fps source into ~9.6 unique frames a
+  second, so every frame is held for three. Juddery, and it re-introduces exactly the
+  duplicate-frame defect the rest of this module exists to remove.
+* *loop with a crossfade at the seam* — motion never stops, no frame is ever held, and
+  the only artefact is a half-second dissolve back to the opening composition.
+
+The third wins on both the metric and the look, so it is what this does. 0.5s matches the
+scene-to-scene transition duration: long enough to read as a dissolve rather than a cut,
+short enough that it does not eat an eighth of the clip.
+"""
+
+CLIP_LOOP_SAFETY = 0.5
+"""Extra seconds of cloned tail appended to a looped clip.
+
+Belt and braces for frame-exactness. An image input is infinite (``-loop 1``) so
+``-frames:v`` can always be satisfied; a clip is finite, and a filtergraph that comes up
+one frame short would silently write a shorter file. ``tpad`` guarantees the graph can
+always over-deliver, and ``-frames:v`` does the actual cutting.
+"""
 
 CLICK_FADE = 0.02
 MUSIC_FADE_IN = 1.5
@@ -232,6 +370,171 @@ def corner_radius(
     return max(0, min(radius, min(region.width, region.height) // 2))
 
 
+def motion_travel(plan: VisualPlan, region: Region) -> float:
+    """How far the move travels, in **output** pixels. 0 for a static shot.
+
+    This is the number a fixed upscale factor ignored, and it is what makes 4x right for
+    one shot and hopelessly short for another. A pan's travel is the slack the zoom buys
+    it; a zoom's is how far the outermost pixel is displaced. Both are measured at the
+    region's scale, because that — not the frame's — is what zoompan now emits.
+    """
+    if plan.motion in (Motion.PAN_LEFT, Motion.PAN_RIGHT):
+        zoom = max(plan.zoom_from, MIN_PAN_ZOOM)
+        return region.width * (1.0 - 1.0 / zoom)
+    if plan.motion in (Motion.ZOOM_IN, Motion.ZOOM_OUT):
+        span = abs(plan.zoom_to - plan.zoom_from)
+        base = max(1e-6, min(plan.zoom_from, plan.zoom_to))
+        return region.width / 2.0 * span / base
+    return 0.0
+
+
+def slowest_step(plan: VisualPlan, region: Region, frames: int) -> float:
+    """Output pixels the move advances on its **slowest** frame.
+
+    The slowest frame is the one that decides whether anything repeats, and with easing it
+    is not the average. A pure smoothstep makes this exactly zero, which is why
+    :data:`EASE_VELOCITY_FLOOR` exists — without a floor there is no finite answer to
+    "how much headroom does this need".
+    """
+    travel = motion_travel(plan, region)
+    if travel <= 0.0 or frames <= 1:
+        return 0.0
+    floor = EASE_VELOCITY_FLOOR if plan.easing == "ease_in_out" else 1.0
+    return floor * travel / frames
+
+
+def peak_step(plan: VisualPlan, region: Region, frames: int) -> float:
+    """Output pixels the move advances on its **fastest** frame — the strobing end.
+
+    Smoothstep peaks at 1.5x the mean rate; the blended curve peaks a little lower.
+    """
+    travel = motion_travel(plan, region)
+    if travel <= 0.0 or frames <= 1:
+        return 0.0
+    gain = 1.0
+    if plan.easing == "ease_in_out":
+        gain = 1.5 * (1.0 - EASE_VELOCITY_FLOOR) + EASE_VELOCITY_FLOOR
+    return gain * travel / frames
+
+
+def detail_upscale(src_size: tuple[int, int], region: Region) -> int:
+    """Isotropic factor for the lanczos fit — how much *detail* the canvas carries.
+
+    Capped by the source: scaling a still past :data:`MAX_SOURCE_UPSCALE` of its own
+    resolution invents pixels that the downscale inside zoompan then discards, which costs
+    time and measurably softens the panel (lanczos ringing on the way up).
+    """
+    src_w, src_h = src_size
+    if src_w <= 0 or src_h <= 0:
+        return 1
+    cover = max(region.width / src_w, region.height / src_h)
+    if cover <= 0:
+        return 1
+    return max(1, min(MAX_DETAIL_UPSCALE, int(MAX_SOURCE_UPSCALE / cover)))
+
+
+def upscale_factors(
+    plan: VisualPlan,
+    region: Region,
+    frames: int,
+    profile: RenderProfile,
+    src_size: tuple[int, int] = (0, 0),
+) -> tuple[int, int, int]:
+    """``(horizontal, vertical, detail)`` canvas oversampling for zoompan.
+
+    ``detail`` is the isotropic factor the source is lanczos-fitted to; ``horizontal`` and
+    ``vertical`` are the canvas the result is then *stretched* to. Splitting the two is the
+    whole trick, because they solve different problems:
+
+    * detail needs real pixels, and the source runs out of them (:func:`detail_upscale`);
+    * positional precision needs a fine integer *grid* to land on, not more information,
+      so a cheap bilinear stretch buys it.
+
+    And the stretch does not have to be isotropic. zoompan crops proportionally to its
+    input and scales to the region, so an anamorphic canvas is exactly un-squeezed on the
+    way out (net scale is ``zoom`` on both axes regardless of the factors). A pan only
+    travels horizontally, so only that axis needs the fine grid — which is what makes the
+    honest fix affordable. Measured on ``hero_right``/``pan_right``, 604 frames, 1080p:
+
+        canvas                     duplicate ratio   render (4s window)
+        3424x3264   (old, 4x4)          46.67%            7.74s
+        13696x13056 (isotropic 16x)     13.33%           64.04s
+        13696x1632  (anamorphic)        11.67%            7.57s
+
+    Same smoothness as the isotropic 16x canvas for an eighth of the time, and no more
+    expensive than the 4x canvas it replaces.
+    """
+    if plan.motion is Motion.STATIC or frames <= 1:
+        return 1, 1, 1
+
+    detail = detail_upscale(src_size, region)
+
+    # The cross axis is fixed by what the motion does to it, and never below the detail
+    # the lanczos fit already produced (the stretch must not downscale).
+    cross = (
+        ZOOM_CROSS_UPSCALE
+        if plan.motion in (Motion.ZOOM_IN, Motion.ZOOM_OUT)
+        else PAN_CROSS_UPSCALE
+    )
+    vertical = max(detail, cross)
+
+    # Spend the remaining area budget on the travel axis.
+    budget = CANVAS_PIXEL_BUDGET * max(1, profile.upscale_factor) / UPSCALE_BUDGET_BASIS
+    per_step = max(1.0, region.width * region.height * vertical)
+    affordable = int(budget // per_step)
+
+    step = slowest_step(plan, region, frames)
+    # step == 0 means the move does not move; ask for everything and let the budget decide.
+    wanted = affordable if step <= 0.0 else math.ceil(CANVAS_STEP_TARGET / step)
+
+    horizontal = max(MIN_TRAVEL_UPSCALE, detail, min(wanted, affordable))
+    return horizontal, vertical, detail
+
+
+def clip_seam(clip_duration: float) -> float:
+    """Crossfade at a looped clip's seam, clamped so it cannot swallow the clip."""
+    return max(0.0, min(CLIP_SEAM_CROSSFADE, clip_duration / 4.0))
+
+
+def clip_loop_count(clip_duration: float, needed: float) -> int:
+    """How many passes of the clip cover ``needed`` seconds, allowing for the seams.
+
+    ``n`` passes crossfaded at ``seam`` yield ``n*clip - (n-1)*seam`` seconds, because an
+    xfade consumes its overlap exactly as it does between scenes.
+    """
+    if clip_duration <= 0:
+        return 1
+    if needed <= clip_duration:
+        return 1
+    seam = clip_seam(clip_duration)
+    period = clip_duration - seam
+    if period <= 0:
+        return 1
+    return 1 + math.ceil((needed - clip_duration) / period)
+
+
+def clip_loop_span(clip_duration: float, loops: int) -> float:
+    """Seconds a crossfaded loop of ``loops`` passes actually produces."""
+    if loops <= 1:
+        return clip_duration
+    return loops * clip_duration - (loops - 1) * clip_seam(clip_duration)
+
+
+def eased_progress(expression: str, easing: str) -> str:
+    """0..1 progress with the requested easing, as an ffmpeg expression.
+
+    ``ease_in_out`` is a smoothstep blended with a linear ramp so that its velocity never
+    reaches zero — see :data:`EASE_VELOCITY_FLOOR`. Both endpoints are still exact (the
+    blend of two curves that pass through 0 and 1 also passes through 0 and 1), so a move
+    still starts and finishes precisely where the plan says.
+    """
+    if easing != "ease_in_out":
+        return expression
+    smooth = f"({expression}*{expression}*(3-2*{expression}))"
+    weight = 1.0 - EASE_VELOCITY_FLOOR
+    return f"({weight:g}*{smooth}+{EASE_VELOCITY_FLOOR:g}*{expression})"
+
+
 def resolve_logo_source(configured: Path | str | None = AUTO_LOGO) -> Path | None:
     """The brand mark to composite, or ``None`` for no branding.
 
@@ -309,11 +612,17 @@ class FFmpegBackend:
         *,
         bullets: list[BulletPoint] | None = None,
         scene_text: SceneText | None = None,
+        video_path: Path | str | None = None,
     ) -> Path:
         """Render one slide — solid background, image panel, animated text — to a clip.
 
         The clip is exactly ``round(duration * fps)`` frames so it matches its
         narration segment. Verified with ffprobe before returning.
+
+        ``video_path`` makes the visual a generated clip rather than a still and takes
+        precedence over ``image_path`` when both are given, which is what
+        ``Scene.video_path`` means. The frame count is identical either way: the visual
+        source changes, the timing contract does not.
 
         ``scene_text`` may be supplied by the caller (tests, or a pipeline that
         rasterises text elsewhere); otherwise it is built here from ``heading`` and
@@ -327,19 +636,45 @@ class FFmpegBackend:
 
         region = layout_region(plan, profile, theme=self.theme)
         image_path = Path(image_path) if image_path else None
+        video_path = Path(video_path) if video_path else None
+        clip_duration = clip_fps = 0.0
+
         if region is not None:
-            if image_path is None:
+            source = video_path or image_path
+            if source is None:
                 raise RenderError(f"layout {plan.layout.value} needs an image, none was given")
-            if not image_path.is_file():
-                raise RenderError(f"scene image not found: {image_path}")
+            if not source.is_file():
+                kind = "clip" if video_path else "image"
+                raise RenderError(f"scene {kind} not found: {source}")
+            if video_path is not None:
+                summary = ff.probe_summary(video_path)
+                clip_duration, clip_fps = summary["duration"], summary["fps"]
+                if clip_duration <= 0:
+                    raise RenderError(f"generated clip has no usable duration: {video_path}")
+                src_size = (summary["width"], summary["height"])
+                if summary["audio_codec"]:
+                    logger.debug(
+                        "generated clip %s carries a %s track; the graph reads [0:v] only "
+                        "and the encode is -an, so it is discarded",
+                        video_path.name, summary["audio_codec"],
+                    )
+            else:
+                src_size = ff.probe_image_size(image_path)
+        else:
+            src_size = (0, 0)
 
         frames = max(1, int(round(duration * profile.fps)))
-        src_size = ff.probe_image_size(image_path) if region is not None else (0, 0)
 
         inputs: list[str | Path] = []
         if region is not None:
-            assert image_path is not None
-            inputs += ["-loop", "1", "-framerate", str(profile.fps), "-i", image_path]
+            if video_path is not None:
+                # No -loop and no -framerate: the clip carries its own timing, and the
+                # graph resamples it. -an here is the first of two defences against the
+                # provider's audio track; the second is that nothing references [0:a].
+                inputs += ["-an", "-i", video_path]
+            else:
+                assert image_path is not None
+                inputs += ["-loop", "1", "-framerate", str(profile.fps), "-i", image_path]
 
         text_layout = tx.layout_heading(heading, plan, profile)
         if scene_text is None and self.text_mode == "png":
@@ -375,6 +710,8 @@ class FFmpegBackend:
             has_text_input=text_png is not None,
             scene_text=scene_text,
             has_image_input=region is not None,
+            clip_duration=clip_duration if video_path else 0.0,
+            clip_fps=clip_fps if video_path else 0.0,
         )
 
         ff.ffmpeg(
@@ -443,9 +780,10 @@ class FFmpegBackend:
             # A title card is solid colour plus type: it has no image region, so
             # demanding an image would fail a slide that is by design image-free.
             needs_image = layout_region(scene.plan, out.profile, theme=self.theme) is not None
-            if needs_image and not scene.image_path:
+            if needs_image and not (scene.video_path or scene.image_path):
                 raise RenderError(
-                    f"scene {scene.id} has no image_path but layout is {scene.plan.layout.value}"
+                    f"scene {scene.id} has no image_path or video_path but layout is "
+                    f"{scene.plan.layout.value}"
                 )
 
         workers, threads = out.profile.resolve_concurrency(len(out.scenes))
@@ -500,6 +838,7 @@ class FFmpegBackend:
             clip,
             profile,
             bullets=scene.bullets,
+            video_path=scene.video_path,
         )
         scene.clip_path = str(clip)
 
@@ -558,20 +897,34 @@ class FFmpegBackend:
         has_text_input: bool = False,
         scene_text: SceneText | None = None,
         has_image_input: bool = True,
+        clip_duration: float = 0.0,
+        clip_fps: float = 0.0,
     ) -> str:
         """The whole per-scene filtergraph, ending in ``[vout]``.
 
-        Built back to front: solid background, image panel (with its own Ken Burns),
-        then one overlay stage per animated text layer.
+        Built back to front: solid background, image panel (with its own Ken Burns, or a
+        fitted generated clip when ``clip_duration`` is set), then one overlay stage per
+        animated text layer.
         """
         parts = self._background_chain(plan, profile)
         base = "bg"
 
         region = layout_region(plan, profile, theme=self.theme)
         if region is not None and has_image_input:
-            parts += self._image_chain(
-                src_size=src_size, plan=plan, profile=profile, frames=frames, region=region
-            )
+            if clip_duration > 0:
+                parts += self._clip_chain(
+                    src_size=src_size,
+                    clip_duration=clip_duration,
+                    clip_fps=clip_fps,
+                    plan=plan,
+                    profile=profile,
+                    frames=frames,
+                    region=region,
+                )
+            else:
+                parts += self._image_chain(
+                    src_size=src_size, plan=plan, profile=profile, frames=frames, region=region
+                )
             parts.append(f"[{base}][hero]overlay=x={region.x}:y={region.y}:format=auto[base]")
             base = "base"
 
@@ -619,47 +972,183 @@ class FFmpegBackend:
     ) -> list[str]:
         """Fit, animate and round the image *inside its region*, ending in ``[hero]``.
 
-        The upscale-before-zoompan trick is relative to the **region**, not the frame:
-        a 46%-width panel needs 46% of the pixels, so this is cheaper than the
-        full-frame version it replaces while removing the same integer stepping.
+        The pre-upscale is relative to the **region**, not the frame, and is derived rather
+        than fixed — see :func:`upscale_factors` for why, and for why the canvas it asks
+        for is usually anamorphic.
         """
         static = plan.motion is Motion.STATIC
-        upscale = 1 if static else max(1, profile.upscale_factor)
-        work = (region.width * upscale, region.height * upscale)
+        horizontal, vertical, detail = upscale_factors(
+            plan, region, frames, profile, src_size=src_size
+        )
+        fit = (region.width * detail, region.height * detail)
 
         parts = self._fit_chain(
             src_size,
             (region.width, region.height),
-            work,
+            fit,
             blur_fill=plan.layout is SlideLayout.FULL_BLEED,
         )
+
         if static:
             parts.append("[fit]null[moved]")
         else:
+            canvas = (region.width * horizontal, region.height * vertical)
+            if canvas != fit:
+                # Bilinear on purpose: this stretch adds no information, only a finer
+                # integer grid for zoompan's x/y to land on, and lanczos here would cost
+                # real time to ring a canvas that is about to be resampled back down.
+                parts.append(f"[fit]scale={canvas[0]}:{canvas[1]}:flags=bilinear[canvas]")
+                source = "canvas"
+            else:
+                source = "fit"
+            self._warn_if_strobing(plan, region, frames)
             z, x, y = self._zoompan_expressions(plan, frames)
             parts.append(
-                f"[fit]zoompan=z='{z}':x='{x}':y='{y}'"
+                f"[{source}]zoompan=z='{z}':x='{x}':y='{y}'"
                 f":d={frames}:fps={profile.fps}:s={region.width}x{region.height}[moved]"
             )
+            logger.debug(
+                "ken burns %s/%s: region %dx%d, travel %.1fpx over %d frames, "
+                "canvas %dx%d (h=%d v=%d detail=%d), slowest %.4fpx/frame, peak %.3fpx/frame",
+                plan.layout.value, plan.motion.value, region.width, region.height,
+                motion_travel(plan, region), frames, region.width * horizontal,
+                region.height * vertical, horizontal, vertical, detail,
+                slowest_step(plan, region, frames), peak_step(plan, region, frames),
+            )
 
+        return parts + self._corner_chain(plan, region, profile)
+
+    def _warn_if_strobing(self, plan: VisualPlan, region: Region, frames: int) -> None:
+        """The opposite failure to stepping: a move fast enough to strobe.
+
+        Reported rather than corrected. Slowing it down here would silently contradict the
+        plan; the honest fixes — a smaller zoom span or a longer scene — are the planner's.
+        """
+        peak = peak_step(plan, region, frames)
+        if peak > STROBE_STEP_PIXELS:
+            logger.warning(
+                "%s/%s moves %.1f output px per frame at its fastest (over %.1f is visible "
+                "strobing): %.0fpx of travel across a %dx%d region in %d frames. Reduce the "
+                "zoom span or lengthen the scene.",
+                plan.layout.value, plan.motion.value, peak, STROBE_STEP_PIXELS,
+                motion_travel(plan, region), region.width, region.height, frames,
+            )
+
+    def _corner_chain(
+        self, plan: VisualPlan, region: Region, profile: RenderProfile
+    ) -> list[str]:
+        """Round the panel's corners: ``[moved]`` -> ``[hero]``. Shared by stills and clips."""
         radius = corner_radius(plan, region, profile, self.theme)
         if radius <= 0:
-            parts.append("[moved]null[hero]")
-            return parts
+            return ["[moved]null[hero]"]
 
         # The mask is constant, so evaluate geq for exactly one frame and let `loop`
         # repeat it forever. Per-frame geq over a 900x900 panel doubles the CPU of the
         # whole clip; this way it costs one frame's worth, once.
-        parts.append(
+        return [
             f"color=c=white:s={region.width}x{region.height}"
-            f":r={profile.fps}:d={1.0 / profile.fps:.6f}[maskraw]"
-        )
-        parts.append(
+            f":r={profile.fps}:d={1.0 / profile.fps:.6f}[maskraw]",
             f"[maskraw]format=gray,geq=lum='{self._round_rect_expr(radius)}'"
-            ",loop=loop=-1:size=1:start=0[mask]"
+            ",loop=loop=-1:size=1:start=0[mask]",
+            "[moved]format=rgba[heroa];[heroa][mask]alphamerge[hero]",
+        ]
+
+    def _clip_chain(
+        self,
+        *,
+        src_size: tuple[int, int],
+        clip_duration: float,
+        clip_fps: float,
+        plan: VisualPlan,
+        profile: RenderProfile,
+        frames: int,
+        region: Region,
+    ) -> list[str]:
+        """Fit a generated clip into its region, ending in ``[hero]``.
+
+        Four things this does differently from a still, each for a stated reason:
+
+        *No zoompan.* The footage already moves. A camera move on top of moving footage
+        reads as seasick, so a clip scene is framed statically and the clip supplies all
+        the movement — regardless of what ``plan.motion`` asks for.
+
+        *fps conversion.* ``fps`` resamples the clip's 24 to the timeline's 30 by repeating
+        one frame in five. That is a 20% duplicate-frame floor which no amount of care
+        removes without motion interpolation (``minterpolate``, which costs more than the
+        rest of the scene put together and invents motion that was never shot). Preserving
+        real-time speed is worth a 4:5 cadence; see the report in ``scratchpad/motionfix``.
+
+        *Looping.* The clip is shorter than the scene, so it repeats with a crossfade at
+        the seam — see :data:`CLIP_SEAM_CROSSFADE` for the three options and the numbers.
+
+        *No audio.* Only ``[0:v]`` is ever referenced, so the clip's own AAC track cannot
+        reach the output even if the provider forgot to strip it.
+        """
+        fit = self._fit_chain(
+            src_size,
+            (region.width, region.height),
+            (region.width, region.height),
+            blur_fill=plan.layout is SlideLayout.FULL_BLEED,
         )
-        parts.append("[moved]format=rgba[heroa];[heroa][mask]alphamerge[hero]")
-        return parts
+        # Normalise the cadence *before* the fit's label is consumed, so every looped
+        # branch is already on the output frame rate and the xfade offsets below are exact.
+        parts = [f"[0:v]fps={profile.fps},setpts=PTS-STARTPTS[clipsrc]"]
+        parts += [part.replace("[0:v]", "[clipsrc]", 1) for part in fit]
+
+        self._warn_if_clip_is_upscaled(src_size, region, plan)
+
+        need = frames / profile.fps
+        loops = clip_loop_count(clip_duration, need)
+        if loops <= 1:
+            parts.append("[fit]null[looped]")
+        else:
+            seam = clip_seam(clip_duration)
+            branches = "".join(f"[cl{index}]" for index in range(loops))
+            parts.append(f"[fit]split={loops}{branches}")
+            accumulator = "cl0"
+            for index in range(1, loops):
+                offset = index * (clip_duration - seam)
+                label = f"cx{index}"
+                parts.append(
+                    f"[{accumulator}][cl{index}]xfade=transition=fade"
+                    f":duration={seam:.6f}:offset={offset:.6f}[{label}]"
+                )
+                accumulator = label
+            parts.append(f"[{accumulator}]null[looped]")
+            logger.info(
+                "clip scene: %.3fs of footage covering %.3fs — %d passes crossfaded %.2fs "
+                "at each seam (%d seams)",
+                clip_duration, need, loops, seam, loops - 1,
+            )
+
+        # tpad can only ever add frames past the end, and -frames:v cuts to the exact
+        # count, so the clip path lands on the same frame grid as the still path.
+        parts.append(
+            f"[looped]tpad=stop_mode=clone:stop_duration={CLIP_LOOP_SAFETY:.3f},"
+            f"setpts=PTS-STARTPTS,setsar=1[moved]"
+        )
+        return parts + self._corner_chain(plan, region, profile)
+
+    @staticmethod
+    def _warn_if_clip_is_upscaled(
+        src_size: tuple[int, int], region: Region, plan: VisualPlan
+    ) -> None:
+        """Flag a region the clip cannot fill at its native resolution.
+
+        A 1280x720 clip has plenty of pixels for an ~857px-wide hero panel and not enough
+        for a 1080p ``full_bleed``, where covering the frame is a 1.5x upscale. Worth
+        saying out loud, because it is invisible in a filtergraph and obvious on screen.
+        """
+        src_w, src_h = src_size
+        if src_w <= 0 or src_h <= 0:
+            return
+        cover = max(region.width / src_w, region.height / src_h)
+        if cover > 1.0:
+            logger.warning(
+                "generated clip is %dx%d but %s needs %dx%d: covering the region is a %.2fx "
+                "upscale, so the footage will be softer than a still would be",
+                src_w, src_h, plan.layout.value, region.width, region.height, cover,
+            )
 
     @staticmethod
     def _round_rect_expr(radius: int) -> str:
@@ -723,14 +1212,14 @@ class FFmpegBackend:
     def _zoompan_expressions(plan: VisualPlan, frames: int) -> tuple[str, str, str]:
         """Build the ``z``/``x``/``y`` expressions.
 
-        Easing lives *in the expression* — a smoothstep on ``on/(frames-1)`` — because
-        zoompan has no easing of its own and a linear ramp starts and stops abruptly.
-        Every expression is emitted inside single quotes by the caller so commas and
-        colons in future expressions cannot break the filtergraph.
+        Easing lives *in the expression* — see :func:`eased_progress` — because zoompan has
+        no easing of its own and a linear ramp starts and stops abruptly. Every expression
+        is emitted inside single quotes by the caller so commas and colons in future
+        expressions cannot break the filtergraph.
         """
         last = max(1, frames - 1)
         t = f"(on/{last})" if frames > 1 else "(0)"
-        progress = f"({t}*{t}*(3-2*{t}))" if plan.easing == "ease_in_out" else t
+        progress = eased_progress(t, plan.easing)
 
         centre_x, centre_y = "(iw-iw/zoom)/2", "(ih-ih/zoom)/2"
 
@@ -1307,11 +1796,19 @@ class FFmpegBackend:
         dB and does not require decoding the whole programme twice for a value nothing
         downstream reads. Approximate is the right trade here.
 
-        The ``atrim``/``apad`` pair is not decoration. ``loudnorm`` runs an internal
-        lookahead buffer and can return a stream a few samples longer or shorter than it
-        was handed; a container is as long as its longest stream, and :meth:`assemble`
-        asserts that length against ``Timeline.final_duration()``. Clamping here is what
-        keeps a *loudness* change from becoming a *duration* change.
+        The ``atrim``/``apad`` pair is not decoration, and on its own it is not enough.
+        ``loudnorm`` runs a lookahead buffer and hands back a stream whose timestamps it has
+        re-based off its own internal block clock rather than passing the input's through.
+        ``atrim`` selects on *timestamps*, so once loudnorm has moved them the trim window
+        no longer lines up with the samples and the clamp leaks. Measured on the reference
+        render: ``loudnorm`` alone put **+0.066992s (+2.01 frames at 30fps)** past a
+        ``atrim=0:74.633008``, and because a container is as long as its longest stream that
+        landed as the whole file's 2.4-frame drift. ``alimiter`` is duration-neutral and the
+        logo overlay was innocent — both were checked separately.
+
+        ``asetpts=N/SR/TB`` regenerates timestamps from the running sample count, which puts
+        the stream back on a sample-exact clock before it is clamped. With it the same graph
+        lands on 74.633000s, i.e. exactly the length asked for.
         """
         chain: list[str] = []
         if ff.has_filter("loudnorm"):
@@ -1329,7 +1826,12 @@ class FFmpegBackend:
             # two agree about what "true peak" means instead of one undoing the other.
             limit = 10 ** (LOUDNESS_TRUE_PEAK_DB / 20)
             chain.append(f"alimiter=limit={limit:.4f}:level=disabled")
-        chain += [f"atrim=0:{total:.6f}", f"apad=whole_dur={total:.6f}"]
+        # Order is load-bearing: rebase the clock, *then* clamp against it.
+        chain += [
+            "asetpts=N/SR/TB",
+            f"atrim=0:{total:.6f}",
+            f"apad=whole_dur={total:.6f}",
+        ]
         return [f"[{label}]" + ",".join(chain) + "[amaster]"], "[amaster]"
 
     # ----------------------------------------------------------------- encode

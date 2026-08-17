@@ -26,6 +26,16 @@ and there the scrim opacity is *derived* from the image: sample the luminance of
 region the text will actually occupy and solve for the opacity that clears WCAG AA
 (4.5:1). A fixed opacity is what made white headings marginal over a sunlit sky.
 
+*Uniformity is a hard invariant, not a preference.* The first render of this module was
+rejected on sight for looking "all over the place", and the specific thing the viewer named
+was two marker shapes in one list (a filled disc for the emphasised bullet, a hollow ring
+for the rest). They were right, and the lesson generalises: within one video there is **one
+type scale** (see ``TYPE_SCALE_RATIO``), **one marker shape** (``Theme.marker``), **one text
+colour** (``Theme.uniform_text``), one rule width, one bullet pitch, and one fixed grid that
+the heading and the first bullet land on whatever the copy does. ``docs/DIRECTION.md`` is
+the normative source for those numbers; where a constant here disagreed with it, DIRECTION
+won, and the constant says so.
+
 Layer emission
 --------------
 Every scene gets exactly one ``kind="scrim"`` layer, and it is always full-frame RGBA:
@@ -37,7 +47,8 @@ Every scene gets exactly one ``kind="scrim"`` layer, and it is always full-frame
 * ``full_bleed`` — a dark adaptive gradient over the text region only, transparent
   elsewhere.
 
-Then one ``kind="heading"`` layer and one ``kind="bullet"`` layer per bullet.
+Then one ``kind="heading"`` layer, one ``kind="bullet"`` layer per bullet, and — on a title
+card only — one ``kind="kicker"``.
 """
 
 from __future__ import annotations
@@ -2079,6 +2090,10 @@ class SlidePlan:
         ``text_rects``, because that is what the PNGs are sized to.
         """
         rects: list[Rect] = []
+        if self.kicker_rect is not None:
+            rects.append(
+                _inset_x(self.kicker_rect, self.ink_pad, self.geometry.align == "center")
+            )
         if self.heading_lines:
             inset = self.ink_pad
             if self.geometry.align == "center" and self.rule_rect is not None:
@@ -2941,10 +2956,10 @@ def build_scene_text(
     budget. Both it and ``emphasis_mode`` are optional keywords with inferred defaults, so
     a caller that does not know about roles keeps working unchanged.
 
-    Layers, in draw order: one full-frame ``scrim`` (the brand background with the hero
-    hole punched out, or the adaptive dark gradient for ``full_bleed``), then the title
-    card's ``kicker`` if it has one, then ``heading``, then one ``bullet`` per point. Every
-    ``x/y/width/height`` is in output-frame pixels and is the layer's *final* resting place.
+    Layers: one full-frame ``scrim`` (the brand background with the hero hole punched out,
+    or the adaptive dark gradient for ``full_bleed``), one ``heading``, one ``bullet`` per
+    point, and — on a title card only — one ``kicker``. Every ``x/y/width/height`` is in
+    output-frame pixels and is the layer's *final* resting place.
     """
     binary = require_imagemagick()
     slide = slide or layout_slide(
@@ -3054,7 +3069,11 @@ def build_scene_text(
                     animation=TextAnimation.FADE_IN,
                     anim_duration=min(plan.anim_duration, KICKER_ANIM_DURATION),
                     slide_distance=slide_distance,
-                    kind="heading",
+                    # A fourth kind, which `SceneText.sorted_layers` ranks after the bullets.
+                    # Harmless — the kicker's box overlaps nothing, so its composite order
+                    # cannot matter — and it keeps `kind == "heading"` meaning exactly one
+                    # layer for every existing caller.
+                    kind="kicker",
                 )
             )
 

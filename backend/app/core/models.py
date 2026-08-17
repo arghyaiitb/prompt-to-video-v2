@@ -50,6 +50,37 @@ class TextAnimation(StrEnum):
     TYPEWRITER = "typewriter"
 
 
+class Language(StrEnum):
+    """Narration + on-screen language. Measured constraints per language, not assumptions.
+
+    English and Spanish are straightforward. Hindi is not, and the differences are
+    load-bearing rather than cosmetic:
+
+    * **No Deepgram TTS voice exists for Hindi** (0 of 102). Its only path is AWS Polly
+      via ``Aditi``/``Kajal``, which are ``en-IN`` voices that carry ``hi-IN`` in
+      ``AdditionalLanguageCodes`` — so the request must set ``LanguageCode`` explicitly.
+    * **Devanagari needs a shaping engine.** Rendering फ़िशिंग through plain freetype
+      drops the nukta and anusvara and yields फिशिग. Text must go through Pango
+      (HarfBuzz), and the font must be a Devanagari face — Arial has no such glyphs.
+    * **Word-level alignment must be verified per language.** Bullet anchoring depends on
+      the aligner returning word timings; without it, bullets fall back to proportional
+      placement and stop matching the narration.
+    """
+
+    EN = "en"
+    ES = "es"
+    HI = "hi"
+
+    @property
+    def script(self) -> Literal["latin", "devanagari"]:
+        return "devanagari" if self is Language.HI else "latin"
+
+    @property
+    def needs_shaping(self) -> bool:
+        """True when glyph shaping is required and naive rendering corrupts the text."""
+        return self.script != "latin"
+
+
 class SceneRole(StrEnum):
     """What a scene is FOR. Drives duration, layout, type scale and bullet budget.
 
@@ -401,6 +432,9 @@ class Timeline(BaseModel):
     title: str
     scenes: list[Scene]
     voice: str
+    language: Language = Language.EN
+    """Drives script generation, voice selection, font choice and text shaping."""
+
     music_path: str | None = None
     profile: RenderProfile = Field(default_factory=RenderProfile)
     theme: Theme = Field(default_factory=Theme)

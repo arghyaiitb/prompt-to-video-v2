@@ -132,6 +132,39 @@ def probe_image_size(path: str | Path) -> tuple[int, int]:
     return int(st["width"]), int(st["height"])
 
 
+def count_frames(path: str | Path) -> int:
+    """Video frames actually in the file, by decoding it.
+
+    ``probe_summary()['nb_frames']`` is container metadata and some muxers simply do not
+    write it. This decodes, so it is slower and it is the truth — which is what a claim
+    about frame-exactness needs to rest on.
+    """
+    out = subprocess.run(  # noqa: S603
+        [
+            ffprobe_bin(),
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-count_frames",
+            "-show_entries",
+            "stream=nb_read_frames",
+            "-of",
+            "default=nokey=1:noprint_wrappers=1",
+            str(path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if out.returncode != 0:
+        raise FFmpegError([ffprobe_bin(), str(path)], out.returncode, out.stderr)
+    value = out.stdout.strip().splitlines()[0] if out.stdout.strip() else ""
+    if not value.isdigit():
+        raise FFmpegError([ffprobe_bin(), str(path)], 0, f"no frame count in {out.stdout!r}")
+    return int(value)
+
+
 def probe_summary(path: str | Path) -> dict:
     """The handful of numbers worth reporting after a render."""
     data = probe(path)

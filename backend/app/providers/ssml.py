@@ -710,6 +710,70 @@ def estimate_pause_seconds(ssml: str) -> float:
     return round(total, 3)
 
 
+BREAK_COST_FACTOR = {
+    "polly-generative": 0.919,
+    "polly-neural": 1.05,
+    "polly-long-form": 1.08,
+}
+"""Wall-clock cost of a `<break>` as a multiple of its nominal duration, MEASURED.
+
+A/B on identical text across five scenes per tier, plain versus marked-up. Generative was
+remarkably consistent (0.918-0.920 over 1 and 3 break scenes); neural and long-form came in
+slightly OVER nominal once the role rate is accounted for, because the engine also stretches
+the delivery around a pause. Unlisted engines fall back to 1.0.
+"""
+
+SPELL_OUT_SECONDS_PER_CHAR = 0.28
+"""Extra wall-clock per character of a `<say-as interpret-as="characters">` run.
+
+Measured on generative: "MFA" cost +0.896s over the same sentence unmarked (3 chars), and
+"IT" +0.486s (2 chars). This is NOT a pause, so it is excluded from
+:func:`estimate_pause_seconds` — but it is real duration, and it was the entire explanation
+for a scene overshooting its predicted length by 0.49s during verification.
+"""
+
+
+def estimate_duration(plain_seconds: float, ssml: str, *, engine: str | None = None) -> float:
+    """Predict the spoken length of `ssml`, given how long the plain narration takes.
+
+    This is the budgeting call: compare the result against `SceneRole.target_duration` before
+    committing to markup. Three effects are modelled, in the order they matter — the role's
+    `<prosody rate>` (exactly proportional), inserted breaks (see
+    :data:`BREAK_COST_FACTOR`), and spelled-out acronyms
+    (:data:`SPELL_OUT_SECONDS_PER_CHAR`).
+
+    Verified against the live measurements to within ~3%: a neural title card measured
+    1.753s against 1.766s predicted, and a 3-break generative content scene measured
+    11.123s against 11.123s predicted.
+
+    Scene boundaries are still derived from REAL audio, so an error here never desyncs
+    anything — it only means a scene lands outside the length its role wanted.
+    """
+    factor = BREAK_COST_FACTOR.get(capability(engine).engine, 1.0)
+    seconds = max(0.0, plain_seconds) / _outer_rate(ssml)
+    seconds += estimate_pause_seconds(ssml) * factor
+    seconds += _spelled_chars(ssml) * SPELL_OUT_SECONDS_PER_CHAR
+    return round(seconds, 3)
+
+
+def _outer_rate(ssml: str) -> float:
+    """The document-level `<prosody rate="N%">` as a multiplier, or 1.0."""
+    match = re.search(r"<speak[^>]*>\s*<prosody[^>]*\brate\s*=\s*[\"'](\d+)%[\"']", ssml or "")
+    if not match:
+        return 1.0
+    percent = int(match.group(1))
+    return percent / 100.0 if percent > 0 else 1.0
+
+
+def _spelled_chars(ssml: str) -> int:
+    """Characters inside `say-as characters`/`spell-out` runs, which are read one by one."""
+    pattern = re.compile(
+        r"<say-as[^>]*interpret-as\s*=\s*[\"'](?:characters|spell-out)[\"'][^>]*>(.*?)</say-as>",
+        re.DOTALL | re.IGNORECASE,
+    )
+    return sum(len(re.sub(r"[^A-Za-z0-9]", "", body)) for body in pattern.findall(ssml or ""))
+
+
 def pause_budget(role: SceneRole | None) -> float:
     """Seconds of inserted silence a role can absorb. See :data:`PAUSE_BUDGET_FRACTION`."""
     return _role_pause_budget(role)

@@ -24,12 +24,13 @@ import base64
 import inspect
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from app.core.models import Motion, SceneRole, SceneScript, Word
+from app.core.models import Language, Motion, SceneRole, SceneScript, Word
 from app.core.ports import (
     Aligner,
     ImageProvider,
@@ -70,13 +71,31 @@ from app.providers.gemini_script import (
     BULLET_CHAR_MAX,
     BULLET_DEFAULT,
     BULLET_MIN,
+    DANDA,
     HEADING_CHAR_MAX,
+    LANGUAGE_ANCHOR_NOTES,
+    LANGUAGE_CLAUSES,
+    LANGUAGE_NAMES,
+    MEASURED_WPM,
+    ROLE_NARRATION_WORDS,
     STRUCTURE_FROM_SLIDES,
     SUMMARY_FROM_SLIDES,
     TITLE_CHAR_MAX,
     TONE_CLAUSES,
+    WORDS_PER_MINUTE,
     StructuredSceneScript,
+    _bullets_from,
+    _clean_bullet,
+    _clean_bullets,
+    _clean_heading,
+    _fragment_from,
+    _heading_from,
     _split_into_segments,
+    _words,
+    anchoring_supported,
+    coerce_language,
+    language_word_factor,
+    language_wpm,
     narration_words,
     role_bullet_target,
     role_plan,
@@ -639,16 +658,31 @@ class TestBulletBudgetAndTone:
     )
     def test_signature_matches_the_protocol_exactly(self, factory):
         """`pipeline._script_kwargs` inspects the real signature, so name, kind and
-        default all have to match the Protocol or the choices are silently dropped."""
+        default all have to match the Protocol or the choices are silently dropped.
+
+        A provider must accept EVERY parameter the Protocol declares, positionally in the
+        same order, with the same kind and default. It may accept more: `_script_kwargs`
+        passes a fixed set of knobs, so an extra keyword-only parameter with a default is
+        invisible to it, and `language` is exactly that — it is on the providers ahead of
+        the Protocol so the API can be wired to it. What the assertion still forbids is the
+        real failure mode: a provider MISSING a knob the Protocol promises, or renaming or
+        reordering one, which is how `bullets_per_slide`/`tone` were dropped before.
+        """
         provider = factory()
         expected = inspect.signature(ScriptProvider.generate).parameters
         actual = inspect.signature(provider.generate).parameters
         # `self` is bound away on the instance method but present on the Protocol.
         expected = {k: v for k, v in expected.items() if k != "self"}
-        assert list(actual) == list(expected)
+        assert list(actual)[: len(expected)] == list(expected)
         for name, param in expected.items():
             assert actual[name].kind is param.kind, name
             assert actual[name].default == param.default, name
+        for extra in set(actual) - set(expected):
+            # An extra parameter is only invisible to the pipeline if it is keyword-only
+            # AND defaulted; a required extra would make every existing call site a
+            # TypeError.
+            assert actual[extra].kind is inspect.Parameter.KEYWORD_ONLY, extra
+            assert actual[extra].default is not inspect.Parameter.empty, extra
         assert actual["bullets_per_slide"].kind is inspect.Parameter.KEYWORD_ONLY
         assert actual["tone"].kind is inspect.Parameter.KEYWORD_ONLY
         assert isinstance(provider, ScriptProvider)
@@ -1411,6 +1445,32 @@ class TestDeepgramSynthesizer:
         assert all(len(c) <= 100 for c in chunks)
         assert " ".join(chunks).split() == text.split()
 
+    def test_declares_no_ssml_support(self):
+        """Aura vocalises markup rather than parsing it, and there is no flag to change
+        that — see `app/providers/deepgram_tts` for the Deepgram statement and the two API
+        errors proving no SSML request shape exists. Full coverage in test_deepgram_ssml.py.
+        """
+        assert DeepgramSynthesizer.supports_ssml is False
+
+    def test_markup_never_reaches_the_api_even_if_a_caller_ignores_the_flag(
+        self, monkeypatch, tmp_path
+    ):
+        """Defence in depth: tags in the request would be spoken aloud in the video."""
+        wav = _wav_bytes(1.0, tmp_path / "src.wav")
+        requests: list[str] = []
+
+        def fake_post(url, **kwargs):
+            requests.append(kwargs["json"]["text"])
+            return _FakeResponse(content=wav)
+
+        monkeypatch.setattr(deepgram_tts.httpx, "post", fake_post)
+        DeepgramSynthesizer(api_key="k").synthesize(
+            '<speak>Check the sender.<break time="1s"/>Then hover the link.</speak>',
+            "v",
+            tmp_path / "a.wav",
+        )
+        assert requests == ["Check the sender. Then hover the link."]
+
 
 # =========================================================== aligner
 
@@ -1892,3 +1952,569 @@ class TestLiveMusic:
         duration = audio_duration(out)
         assert duration == pytest.approx(45.0, abs=0.1)
         assert duration > 40.0, "looping did not happen — clip length leaked through"
+
+
+# =========================================================== language
+
+
+class TestScriptLanguage:
+    """`generate(..., language=...)` writes the script natively in the target language.
+
+    The three things worth guarding, in order of how expensive they are to get wrong:
+
+      * ENGLISH DOES NOT MOVE. English is the measured baseline (22/22 bullets anchored),
+        so the English prompt must stay byte-identical and the English parse path must be
+        unchanged. Every language-derived insert is empty for `Language.EN`.
+      * A word budget is a DURATION. Reusing English's word count in another language puts
+        the scene outside its role's window, so the budgets scale by measured speaking rate
+        and the test asserts the DURATION is preserved, not the words.
+      * The English/in-language SPLIT. Narration, heading and bullets are in-language;
+        `image_prompt` and `clip_prompt` are English, because the models consuming them are.
+    """
+
+    NARRATION_ES = (
+        "Revise con cuidado la dirección del remitente para confirmar su autenticidad. "
+        "Desconfíe siempre de un tono de urgencia que exija acciones inmediatas. "
+        "Detecte cualquier saludo genérico en lugar de su nombre real. "
+        "Examine los enlaces sospechosos pasando el cursor encima antes de abrirlos."
+    )
+    NARRATION_HI = (
+        "संदेश मिलते ही सबसे पहले भेजने वाले का पता ध्यान से देखें। "
+        "जालसाज अक्सर डोमेन नाम में गड़बड़ी करके असली जैसे दिखने वाले ईमेल भेजते हैं। "
+        "यदि कोई ईमेल तुरंत कार्रवाई का दबाव बनाए, तो सतर्क हो जाएं।"
+    )
+
+    def _prompt(self, monkeypatch, *, slide_count: int = 5, **kwargs) -> str:
+        captured: dict = {}
+
+        def fake(model, body, api_key, **_):
+            captured["text"] = body["contents"][0]["parts"][0]["text"]
+            return _script_response([_scene(1)])
+
+        monkeypatch.setattr("app.providers.gemini_script.generate_content", fake)
+        GeminiScriptProvider(api_key="x").generate("phishing", slide_count, **kwargs)
+        return captured["text"]
+
+    # -------------------------------------------------------------- signature
+
+    @pytest.mark.parametrize(
+        "factory",
+        [
+            lambda: GeminiScriptProvider(api_key="x"),
+            lambda: VerbatimScriptProvider(VERBATIM_TEXT),
+        ],
+    )
+    def test_language_is_keyword_only_with_an_english_default(self, factory):
+        """Keyword-only and defaulted is what keeps every existing caller — and Protocol
+        conformance — working without being touched."""
+        param = inspect.signature(factory().generate).parameters["language"]
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
+        assert param.default is Language.EN
+
+    def test_existing_callers_are_unaffected(self, monkeypatch):
+        """The two-positional-argument call still works and still returns English."""
+        monkeypatch.setattr(
+            "app.providers.gemini_script.generate_content",
+            lambda *a, **k: _script_response([_scene(1), _scene(2)]),
+        )
+        script = GeminiScriptProvider(api_key="x").generate("phishing", 2)
+        assert len(script.scenes) == 2
+
+    # -------------------------------------------------------------- english does not move
+
+    @pytest.mark.parametrize("slide_count", [1, 2, 4, 5, 7, 9])
+    @pytest.mark.parametrize("tone", [None, "technical", "executives"])
+    def test_the_english_prompt_is_unchanged_by_the_existence_of_languages(
+        self, monkeypatch, slide_count, tone
+    ):
+        """Every language-derived insert is empty for English, so there is no new text in
+        the English prompt that could move the measured English result."""
+        prompt = self._prompt(
+            monkeypatch, slide_count=slide_count, tone=tone, language=Language.EN
+        )
+        assert "LANGUAGE — write this video in" not in prompt
+        assert "IN ENGLISH" not in prompt
+        assert "Check the language too" not in prompt
+        # The pre-language wording of the two visual fields, verbatim.
+        assert "image_prompt — describe ONE photographic" in prompt
+        assert "clip_prompt — the SAME shot as image_prompt" in prompt
+        assert f"about {int(WORDS_PER_MINUTE)} words per minute" in prompt
+
+    def test_english_is_the_default_and_the_default_is_english(self, monkeypatch):
+        assert self._prompt(monkeypatch) == self._prompt(monkeypatch, language=Language.EN)
+
+    def test_english_word_budgets_are_exactly_the_direction_table(self):
+        for role in SceneRole:
+            assert narration_words(role) == narration_words(role, Language.EN)
+            assert narration_words(role, Language.EN) == ROLE_NARRATION_WORDS[role]
+
+    # -------------------------------------------------------------- the prompt
+
+    @pytest.mark.parametrize("language", [Language.ES, Language.HI])
+    def test_a_non_english_prompt_asks_for_native_composition_not_translation(
+        self, monkeypatch, language
+    ):
+        prompt = self._prompt(monkeypatch, language=language)
+        assert f"LANGUAGE — write this video in {LANGUAGE_NAMES[language]}" in prompt
+        assert "Compose it NATIVELY" in prompt
+        assert "Do NOT draft in English and translate" in prompt
+
+    @pytest.mark.parametrize("language", [Language.ES, Language.HI])
+    def test_the_visual_prompts_are_pinned_to_english_at_the_field(
+        self, monkeypatch, language
+    ):
+        """Stated where the model is deciding what to write, not only in a block up top."""
+        prompt = self._prompt(monkeypatch, language=language)
+        assert "image_prompt — IN ENGLISH, not in the language of the narration —" in prompt
+        assert "clip_prompt — IN ENGLISH, not in the language of the narration —" in prompt
+        assert "image_prompt and clip_prompt stay in ENGLISH" in prompt
+        assert "image_prompt and clip_prompt in English on every single scene" in prompt
+
+    @pytest.mark.parametrize("language", [Language.ES, Language.HI])
+    def test_each_language_injects_only_its_own_conventions(self, monkeypatch, language):
+        prompt = self._prompt(monkeypatch, language=language)
+        assert LANGUAGE_CLAUSES[language].strip() in prompt
+        for other in (Language.ES, Language.HI):
+            if other is not language:
+                assert LANGUAGE_CLAUSES[other].strip() not in prompt
+
+    def test_the_spanish_clause_demands_accents_and_inverted_punctuation(self, monkeypatch):
+        """Unaccented Spanish reads as machine output, and "está" is not "esta"."""
+        prompt = self._prompt(monkeypatch, language=Language.ES)
+        assert "¿" in prompt and "¡" in prompt
+        assert "fully accented Spanish" in prompt
+
+    def test_the_hindi_clause_demands_the_danda_and_drops_the_casing_rule(self, monkeypatch):
+        """Devanagari is unicameral, so a sentence-case instruction is noise at best; and a
+        Hindi sentence ending in "." is a visible defect, not a nit."""
+        prompt = self._prompt(monkeypatch, language=Language.HI)
+        assert DANDA in prompt
+        assert 'End every\nsentence with the danda' in prompt
+        assert "Devanagari has no upper and lower case" in prompt
+
+    @pytest.mark.parametrize("language", [Language.ES, Language.HI])
+    def test_the_anchor_rule_is_qualified_for_an_inflected_language(
+        self, monkeypatch, language
+    ):
+        """An inflected language can restate a phrase's meaning in a form that shares no
+        word with the narration, which is a silently broken anchor."""
+        prompt = self._prompt(monkeypatch, language=language)
+        # The base rule is still there...
+        assert "CONSECUTIVE CONTENT WORDS" in prompt
+        # ...and now says the echo must be the SAME SURFACE FORM.
+        assert "SURFACE FORM, not meaning" in prompt
+        assert LANGUAGE_ANCHOR_NOTES[language].strip() in prompt
+
+    # -------------------------------------------------------------- word budgets
+
+    @pytest.mark.parametrize("language", list(Language))
+    @pytest.mark.parametrize("role", list(SceneRole))
+    def test_the_word_budget_range_stays_ordered_after_scaling(self, language, role):
+        low, target, high = narration_words(role, language)
+        assert 1 <= low <= target <= high
+
+    @pytest.mark.parametrize("language", list(Language))
+    @pytest.mark.parametrize("role", list(SceneRole))
+    def test_scaling_preserves_the_DURATION_not_the_word_count(self, language, role):
+        """The point of the whole exercise. A word budget is a duration, so the scaled
+        budget must take the same time to speak as the English one does — spoken at that
+        language's own pace."""
+        english = narration_words(role, Language.EN)
+        scaled = narration_words(role, language)
+        for en_words, lang_words in zip(english, scaled, strict=True):
+            en_seconds = en_words / WORDS_PER_MINUTE * 60
+            lang_seconds = lang_words / language_wpm(language) * 60
+            # Within a word of rounding at the language's own rate.
+            assert abs(en_seconds - lang_seconds) <= 60 / language_wpm(language)
+
+    @pytest.mark.parametrize("language", list(Language))
+    @pytest.mark.parametrize("role", list(SceneRole))
+    def test_every_scaled_budget_tracks_its_roles_window(self, language, role):
+        """The per-language generalisation of `test_word_budgets_match_the_role_durations`.
+
+        Same invariant and the same tolerance: the budget's floor CORRESPONDS to the window's
+        floor and its ceiling to the window's ceiling, within one word of rounding at that
+        language's pace. Deliberately not "strictly inside" — the committed English edges are
+        themselves a word either side of the window (a 20-word closing is 8.89s against a 9.0s
+        ceiling), so demanding strict containment would fail English too and would be a claim
+        about `docs/DIRECTION.md`, not about this scaling.
+        """
+        low, target, high = narration_words(role, language)
+        floor, ceiling = role.target_duration
+        slack = 60 / language_wpm(language)  # one word, at this language's rate
+        assert abs(low - words_spoken_in(floor, language)) <= 1.0 + slack, (role, language)
+        assert abs(high - words_spoken_in(ceiling, language)) <= 1.0 + slack, (role, language)
+        assert low <= target <= high
+
+    @pytest.mark.parametrize("language", list(Language))
+    @pytest.mark.parametrize("role", list(SceneRole))
+    def test_the_target_word_count_is_comfortably_inside_the_window(self, language, role):
+        """The TARGET is the number the prompt leads with and the one scenes actually land
+        on, so unlike the range edges it must sit strictly inside the role's window."""
+        target = narration_words(role, language)[1]
+        floor, ceiling = role.target_duration
+        seconds = target / language_wpm(language) * 60
+        assert floor < seconds < ceiling, (role, language, target, seconds)
+
+    def test_a_language_that_speaks_faster_gets_more_words(self):
+        """Spanish and Hindi need more words for the same content AND speak faster, so
+        re-using English's budget would make the scene short, not long."""
+        assert language_word_factor(Language.EN) == 1.0
+        assert language_word_factor(Language.ES) > 1.0
+        assert language_word_factor(Language.HI) > language_word_factor(Language.ES)
+        for role in SceneRole:
+            en = narration_words(role, Language.EN)
+            assert narration_words(role, Language.ES)[1] > en[1]
+            assert narration_words(role, Language.HI)[1] > en[1]
+
+    def test_the_factor_is_the_measured_rate_ratio_and_nothing_else(self):
+        """One number per language, derived — so a budget cannot drift from its evidence."""
+        for language, wpm in MEASURED_WPM.items():
+            expected = round(wpm / MEASURED_WPM[Language.EN], 2)
+            assert language_word_factor(language) == expected
+
+    @pytest.mark.parametrize("language", list(Language))
+    def test_the_prompt_states_the_languages_own_budget_and_pace(self, monkeypatch, language):
+        prompt = self._prompt(monkeypatch, slide_count=7, language=language)
+        assert f"about {int(language_wpm(language))} words per minute" in prompt
+        for index, role in enumerate(role_plan(7), start=1):
+            low, target, high = narration_words(role, language)
+            assert (
+                f"scene {index} — role: {role.value} — narration {target} words "
+                f"({low}-{high})"
+            ) in prompt
+
+    def test_words_spoken_in_follows_the_language(self):
+        assert words_spoken_in(60.0) == pytest.approx(WORDS_PER_MINUTE)
+        assert words_spoken_in(60.0, Language.ES) == pytest.approx(language_wpm(Language.ES))
+        assert words_spoken_in(60.0, Language.HI) > words_spoken_in(60.0, Language.ES)
+
+    # -------------------------------------------------------------- coercion
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            (Language.HI, Language.HI),
+            ("es", Language.ES),
+            (" ES ", Language.ES),
+            ("hi", Language.HI),
+            ("en", Language.EN),
+            ("klingon", Language.EN),
+            ("", Language.EN),
+            (None, Language.EN),
+            (7, Language.EN),
+        ],
+    )
+    def test_a_language_code_or_junk_never_fails_the_job(self, value, expected):
+        """A bad language code is not worth failing a job over when the alternative is a
+        perfectly good English script."""
+        assert coerce_language(value) is expected
+
+    def test_an_unknown_language_string_reaches_the_model_as_english(self, monkeypatch):
+        assert self._prompt(monkeypatch, language="klingon") == self._prompt(monkeypatch)
+
+    # -------------------------------------------------------------- typography
+
+    def test_a_hindi_heading_loses_its_danda_and_an_english_one_its_full_stop(self):
+        assert _clean_heading("संदेश की जांच करें।", Language.HI) == "संदेश की जांच करें"
+        assert _clean_heading("Check the domain.", Language.EN) == "Check the domain"
+        # The danda is not English punctuation, so English leaves it alone rather than
+        # silently editing a character it does not understand.
+        assert _clean_heading("Check the domain।", Language.EN).endswith(DANDA)
+
+    def test_a_hindi_bullet_loses_its_danda(self):
+        assert _clean_bullet("डोमेन नाम जांचें।", Language.HI) == "डोमेन नाम जांचें"
+
+    def test_spanish_opening_punctuation_survives_cleaning(self):
+        """Only the TRAILING end is stripped — an opened question that never closes would
+        be worse than the terminal mark."""
+        assert _clean_heading("¿Reconoce el remitente?", Language.ES).startswith("¿")
+        assert _clean_bullet("¡No haga clic!", Language.ES) == "¡No haga clic"
+
+    def test_devanagari_sentences_split_on_the_danda(self):
+        """Without this a whole Hindi narration is one unsplittable sentence and every path
+        that works by cutting on sentence boundaries quietly gives up."""
+        segments = _split_into_segments(self.NARRATION_HI, 3)
+        assert len(segments) == 3
+        assert all(seg.strip() for seg in segments)
+        # No words invented or lost.
+        assert " ".join(segments).split() == self.NARRATION_HI.split()
+
+    # -------------------------------------------------------------- tokenisation
+
+    def test_the_tokenizer_sees_accents_and_devanagari(self):
+        """The old ASCII-only pattern cut "protección" into "protecci"+"n" and matched
+        nothing whatsoever in Devanagari, so every deterministic fallback returned []."""
+        assert _words("protección") == ["protección"]
+        assert _words("señales de diseño") == ["señales", "de", "diseño"]
+        assert _words("डोमेन नाम जांचें") == ["डोमेन", "नाम", "जांचें"]
+        # ASCII behaviour is untouched.
+        assert _words("don't world-class") == ["don't", "world-class"]
+
+    def test_the_tokenizer_keeps_devanagari_marks_attached(self):
+        """The trap: Python's `\\w` covers L*/N* but NOT Mn/Mc, so a `[^\\W_]+` "Unicode"
+        pattern DROPS every matra, anusvara and nukta — "जांचें" becomes "जच". That is the
+        corruption `Language.needs_shaping` warns about, arriving at the tokeniser."""
+        for word in ("जांचें", "फ़िशिंग", "गड़बड़ी", "व्यक्तिगत", "सुरक्षित"):
+            assert _words(word) == [word], word
+        # Two words that differ ONLY by nukta and anusvara must stay distinct.
+        assert _words("फ़िशिंग") != _words("फिशिग")
+
+    @pytest.mark.parametrize(
+        ("text", "language"),
+        [(NARRATION_ES, Language.ES), (NARRATION_HI, Language.HI)],
+    )
+    def test_fallback_bullets_are_derivable_in_every_language(self, text, language):
+        bullets = _bullets_from(text, 3, language)
+        assert len(bullets) >= 2
+        for bullet in bullets:
+            assert bullet.strip()
+            # Every fragment is a verbatim run of the source, by construction.
+            assert bullet.lower() in text.lower()
+
+    def test_a_spanish_fragment_opens_on_a_content_word_not_an_article(self):
+        """English stopwords applied to Spanish treat "el" as content and open a bullet on
+        it, which reads as a template artefact in any language."""
+        fragment = _fragment_from("el dominio del remitente es falso", Language.ES)
+        assert not fragment.lower().startswith("el ")
+        assert "dominio" in fragment.lower()
+
+    def test_devanagari_headings_are_not_put_through_an_english_casing_rule(self):
+        heading = _heading_from(self.NARRATION_HI, fallback="X", language=Language.HI)
+        assert heading.strip()
+        assert DANDA not in heading
+        # Every word came from the narration, unmodified.
+        for word in heading.split():
+            assert word in self.NARRATION_HI
+
+    # -------------------------------------------------------------- anchoring reality
+
+    def test_anchoring_is_supported_for_latin_scripts(self):
+        assert anchoring_supported(Language.EN) is True
+        assert anchoring_supported(Language.ES) is True
+
+    def test_devanagari_cannot_anchor_and_this_is_measured_not_assumed(self):
+        """THE PRODUCT CONSTRAINT, asserted so it cannot regress silently in either
+        direction.
+
+        `deepgram_align.normalize` keeps only `[a-z0-9]`, so every Devanagari token
+        normalises to "" and no Hindi bullet can ever match its own narration — even when the
+        bullet is a verbatim copy of it, which is what the model actually produces. If this
+        test starts failing because `anchoring_supported(HI)` became True, that is GOOD news:
+        `normalize` was widened, and the Hindi fallback branches here are now dead code that
+        should be removed.
+        """
+        assert anchoring_supported(Language.HI) is False
+        # The cause, spelled out: it is the normaliser, not the model's wording.
+        bullet = "वाले का डोमेन"
+        narration = "भेजने वाले का डोमेन ध्यान से जांचें।"
+        assert bullet in narration, "the bullet IS a verbatim run of the narration"
+        assert anchor_position(bullet, narration) is None, "yet it cannot be anchored"
+        assert normalize("डोमेन") == ""
+
+    def test_hindi_bullets_are_kept_rather_than_shredded_by_a_check_that_cannot_run(self):
+        """Applying the anchor defences to a script the matcher cannot read would demote
+        every bullet the model wrote on the strength of a test that answered "no" to every
+        question — replacing good copy with mechanically sliced fragments."""
+        model_bullets = ["भेजने वाले का पता", "डोमेन नाम में गड़बड़ी", "तुरंत कार्रवाई का दबाव"]
+        kept = _clean_bullets(model_bullets, self.NARRATION_HI, 3, language=Language.HI)
+        assert kept == model_bullets
+
+    def test_spanish_bullets_still_go_through_the_anchor_defences(self):
+        """Spanish accents are stripped on BOTH sides by `normalize`, so they still compare
+        equal and the invariant holds — an unanchored bullet must still yield."""
+        bullets = ["La dirección del remitente", "Algo que no se dice en ninguna parte"]
+        kept = _clean_bullets(bullets, self.NARRATION_ES, 2, language=Language.ES)
+        assert "La dirección del remitente" in kept
+        assert "Algo que no se dice en ninguna parte" not in kept
+        for bullet in kept:
+            assert anchor_position(bullet, self.NARRATION_ES) is not None
+
+    # -------------------------------------------------------------- parse path
+
+    @pytest.mark.parametrize("language", list(Language))
+    def test_the_visual_prompts_pass_through_untranslated(self, monkeypatch, language):
+        """Whatever the model returns for these two fields is carried verbatim — this
+        provider never rewrites them, in any language."""
+        scene = _scene(1)
+        scene["image_prompt"] = "A photograph of a laptop. No text anywhere in the image."
+        scene["clip_prompt"] = "Slow push in on a laptop screen."
+        monkeypatch.setattr(
+            "app.providers.gemini_script.generate_content",
+            lambda *a, **k: _script_response([scene]),
+        )
+        result = GeminiScriptProvider(api_key="x").generate(
+            "phishing", 1, language=language
+        ).scenes[0]
+        assert result.image_prompt == scene["image_prompt"]
+        assert scene_clip_prompt(result) == scene["clip_prompt"]
+
+    @pytest.mark.parametrize(
+        ("language", "narration", "heading"),
+        [
+            (Language.ES, NARRATION_ES, "Señales de alerta"),
+            (Language.HI, NARRATION_HI, "संदेश की जांच करें।"),
+        ],
+    )
+    def test_in_language_narration_survives_the_parse_unchanged(
+        self, monkeypatch, language, narration, heading
+    ):
+        scene = _scene(1, narration=narration)
+        scene["heading"] = heading
+        monkeypatch.setattr(
+            "app.providers.gemini_script.generate_content",
+            lambda *a, **k: _script_response([scene]),
+        )
+        result = GeminiScriptProvider(api_key="x").generate(
+            "phishing", 1, language=language
+        ).scenes[0]
+        assert result.narration == narration
+        assert result.heading == heading.rstrip(DANDA)
+        assert result.bullets, "a scene must still come back with on-screen points"
+
+    # -------------------------------------------------------------- verbatim provider
+
+    def test_the_verbatim_provider_never_translates_a_word(self):
+        """`language` names what script the text is already in; it cannot change the text,
+        because every narration word is the user's own."""
+        script = VerbatimScriptProvider(VERBATIM_TEXT).generate(
+            "bridges", 3, language=Language.ES
+        )
+        assert " ".join(s.narration for s in script.scenes).split() == VERBATIM_TEXT.split()
+
+    def test_a_pasted_hindi_script_is_split_and_cleaned_as_hindi(self):
+        script = VerbatimScriptProvider(self.NARRATION_HI).generate(
+            "phishing email", 3, language=Language.HI
+        )
+        assert len(script.scenes) == 3
+        joined = " ".join(s.narration for s in script.scenes)
+        assert joined.split() == self.NARRATION_HI.split()
+        for scene in script.scenes:
+            assert scene.heading.strip()
+            assert not scene.heading.endswith(DANDA)
+            # Devanagari headings are not put through an English casing rule, so every word
+            # is the source's own, untouched.
+            for word in scene.heading.split():
+                assert word in self.NARRATION_HI, word
+
+    def test_the_verbatim_visual_prompt_never_carries_devanagari_from_the_narration(self):
+        """There is no LLM on this path and so no translator. The English boilerplate stays
+        English and the Devanagari NARRATION is kept out of it entirely — Devanagari keywords
+        in an English-conditioned image prompt are noise, not subject matter.
+
+        The topic is a different matter: it is the caller's own string and is passed through
+        as written, because inventing a translation of it would be worse than quoting it.
+        """
+        scene = VerbatimScriptProvider(self.NARRATION_HI).generate(
+            "phishing email", 2, language=Language.HI
+        ).scenes[0]
+        assert not re.search(r"[ऀ-ॿ]", scene.image_prompt)
+        assert not re.search(r"[ऀ-ॿ]", scene_clip_prompt(scene) or "")
+        assert "phishing email" in scene.image_prompt
+        assert "No text, no letters" in scene.image_prompt
+
+
+@live_only
+class TestLiveScriptLanguage:
+    """Real Gemini, all three languages. The numbers in the report come from here."""
+
+    TOPIC = "spotting phishing email at work"
+    DEVANAGARI = re.compile(r"[ऀ-ॿ]")
+
+    def _words(self, narration: str, wpm: float) -> list[Word]:
+        """Whole-word tokens at a uniform cadence — the token shape an aligner returns.
+        `find_anchors` classifies from the strings, so the cadence cannot change the verdict.
+        """
+        step = 60.0 / wpm
+        return [
+            Word(word=tok, start=i * step, end=(i + 1) * step - 0.01)
+            for i, tok in enumerate(narration.split())
+        ]
+
+    @pytest.mark.parametrize("language", list(Language))
+    def test_a_live_script_is_in_language_paced_and_anchored(self, language):
+        script = GeminiScriptProvider().generate(self.TOPIC, 4, language=language)
+        assert len(script.scenes) == 4
+
+        tally = {"ngram": 0, "fuzzy": 0, "proportional": 0}
+        for scene in script.scenes:
+            role = scene_role(scene)
+            low, _, high = narration_words(role, language)
+            count = len(scene.narration.split())
+            seconds = count / language_wpm(language) * 60
+            floor, ceiling = role.target_duration
+
+            # The script is in the right script.
+            expected_devanagari = language is Language.HI
+            assert bool(self.DEVANAGARI.search(scene.narration)) is expected_devanagari
+            assert bool(self.DEVANAGARI.search(scene.heading)) is expected_devanagari
+
+            # The visual prompts are NOT.
+            assert not self.DEVANAGARI.search(scene.image_prompt)
+            assert not self.DEVANAGARI.search(scene_clip_prompt(scene) or "")
+
+            # Pacing: the word budget is a duration, so the duration is what is checked.
+            assert low - 2 <= count <= high + 2, (language, role, count, low, high)
+            assert floor <= seconds <= ceiling, (language, role, seconds, floor, ceiling)
+
+            if language is Language.HI:
+                assert scene.narration.rstrip().endswith((DANDA, "?", "!"))
+                assert not scene.heading.endswith(DANDA)
+
+            for anchor in find_anchors(
+                scene.bullets,
+                self._words(scene.narration, MEASURED_WPM[language]),
+                0.0,
+                seconds,
+            ):
+                tally[anchor.method] += 1
+
+        total = sum(tally.values())
+        assert total > 0
+        anchored = tally["ngram"] + tally["fuzzy"]
+        if anchoring_supported(language):
+            # The invariant: every bullet quotes its own narration verbatim.
+            assert tally["proportional"] == 0, (language, tally)
+            assert tally["ngram"] == total, (language, tally)
+        else:
+            # Hindi. Documented, measured, and NOT papered over: nothing anchors, because
+            # `normalize` cannot see Devanagari at all.
+            assert anchored == 0, (
+                f"{language} unexpectedly anchored {anchored}/{total} — if `normalize` was "
+                f"widened, delete the Hindi fallback branches in gemini_script"
+            )
+
+    @pytest.mark.parametrize("language", [Language.ES, Language.HI])
+    def test_a_live_bullet_is_a_verbatim_run_of_its_own_narration(self, language):
+        """The prompt-side half of the anchor invariant, and the half this file owns.
+
+        It holds even for Hindi, where the MATCHER cannot confirm it — which is precisely
+        why Hindi's 0/N anchoring is a normaliser limitation rather than a copy problem.
+        """
+        script = GeminiScriptProvider().generate(self.TOPIC, 4, language=language)
+        total = verbatim = 0
+        for scene in script.scenes:
+            narration = re.sub(r"\s+", " ", scene.narration).lower()
+            for bullet in scene.bullets:
+                total += 1
+                if re.sub(r"\s+", " ", bullet).lower() in narration:
+                    verbatim += 1
+        assert total > 0
+        assert verbatim / total >= 0.75, f"{language}: only {verbatim}/{total} verbatim"
+
+    def test_spanish_comes_back_with_real_spanish_orthography(self):
+        """Accent-stripped Spanish reads as machine output, and it was what the model
+        produced before the conventions clause existed."""
+        script = GeminiScriptProvider().generate(self.TOPIC, 5, language=Language.ES)
+        body = " ".join(
+            [script.title]
+            + [f"{s.heading} {s.narration} {' '.join(s.bullets)}" for s in script.scenes]
+        )
+        assert re.search(r"[áéíóúñÁÉÍÓÚÑ]", body), f"no Spanish diacritics at all: {body[:400]}"
+
+    def test_hindi_uses_the_danda_and_not_the_full_stop(self):
+        script = GeminiScriptProvider().generate(self.TOPIC, 5, language=Language.HI)
+        for scene in script.scenes:
+            assert DANDA in scene.narration, scene.narration
+            # A stray Latin full stop mid-narration is the English-typography defect.
+            assert not re.search(r"[ऀ-ॿ]\s*\.", scene.narration), scene.narration

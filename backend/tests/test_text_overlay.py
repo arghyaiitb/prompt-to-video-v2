@@ -15,6 +15,7 @@ Split three ways:
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import subprocess
 from pathlib import Path
 
@@ -23,6 +24,7 @@ import pytest
 from app.core.models import (
     BulletPoint,
     RenderProfile,
+    SceneRole,
     SlideLayout,
     TextAnimation,
     TextPosition,
@@ -325,16 +327,28 @@ def test_hero_layouts_put_text_and_image_on_opposite_sides(layout, text_side):
     assert region is not None
     if text_side == "left":
         assert column.right <= region.x, "text column must not run into the image panel"
-        assert column.right < HD.width * 0.5
+        assert column.x < region.x
     else:
         assert region.right <= column.x
-        assert column.x > HD.width * 0.5
+        assert column.x > region.x
+
+
+def test_hero_grid_matches_the_direction_spec():
+    """DIRECTION §6.2 fixes the grid in pixels. The type scale is derived from this column
+    width (22 characters of a 78px heading), so the two cannot drift apart."""
+    geometry = tx.slide_geometry(VisualPlan(layout=SlideLayout.HERO_RIGHT), HD)
+    assert geometry.text_column.x == 104
+    assert geometry.text_column.width == 904
+    assert geometry.image_region is not None
+    assert geometry.image_region.as_tuple() == (1096, 90, 720, 900)
+    # 4:5 — a requirement on the image provider, not a crop preference.
+    assert geometry.image_region.width / geometry.image_region.height == pytest.approx(0.8)
 
 
 def test_hero_right_text_column_is_a_readable_fraction_of_the_frame():
     geometry = tx.slide_geometry(VisualPlan(layout=SlideLayout.HERO_RIGHT), HD)
     share = geometry.text_column.width / HD.width
-    assert 0.35 <= share <= 0.50
+    assert 0.40 <= share <= 0.50
 
 
 def test_image_band_text_sits_entirely_below_the_band():
@@ -398,10 +412,19 @@ def make_measurer(px_per_char: float = 10.0):
 
 def test_wrap_to_width_keeps_every_line_inside_the_limit():
     measure = make_measurer()
-    lines = tx.wrap_to_width(LONG_BULLET, 400, measure)
+    lines = tx.wrap_to_width(LONG_BULLET, 400, measure, max_lines=8)
     assert len(lines) > 1
     assert all(measure(line) <= 400 for line in lines)
     assert " ".join(lines) == " ".join(LONG_BULLET.split())
+
+
+def test_a_bullet_wraps_to_at_most_two_lines_by_default():
+    """DIRECTION §2.1: a bullet is 34 characters of copy. A third line means the copy rule
+    was broken upstream, and ellipsising is a louder complaint than silently reflowing."""
+    assert tx.MAX_BULLET_LINES == 2
+    lines = tx.wrap_to_width(LONG_BULLET, 400, make_measurer())
+    assert len(lines) == 2
+    assert lines[-1].endswith(tx.ELLIPSIS)
 
 
 def test_wrap_to_width_balances_a_two_line_wrap():
@@ -438,7 +461,7 @@ def test_wrap_to_width_handles_empty_and_whitespace():
 def test_bullet_times_are_monotonic_and_respect_the_minimum_gap():
     plan = VisualPlan(bullet_min_gap=0.6)
     crowded = [BulletPoint(text="a", appear_at=t) for t in (0.0, 0.05, 0.1, 0.15)]
-    times = tx.bullet_times(crowded, plan)
+    times = tx.bullet_times(crowded, plan, first_at=0.0)
     assert times == sorted(times)
     assert all(b - a >= 0.6 - 1e-6 for a, b in zip(times, times[1:], strict=False))
 
@@ -446,9 +469,64 @@ def test_bullet_times_are_monotonic_and_respect_the_minimum_gap():
 def test_bullet_times_respect_a_later_narration_cue():
     plan = VisualPlan(bullet_min_gap=0.6)
     times = tx.bullet_times(
-        [BulletPoint(text="a", appear_at=0.0), BulletPoint(text="b", appear_at=5.0)], plan
+        [BulletPoint(text="a", appear_at=0.0), BulletPoint(text="b", appear_at=5.0)],
+        plan,
+        first_at=0.0,
     )
     assert times == [0.0, 5.0]
+
+
+def test_no_bullet_reveals_before_the_heading_has_finished_arriving():
+    """DIRECTION §4.2. A bullet landing at 0.4s moves while the heading is still moving,
+    and both entrances are lost."""
+    plan = VisualPlan(bullet_min_gap=1.6)
+    times = tx.bullet_times(
+        [BulletPoint(text="a", appear_at=0.0), BulletPoint(text="b", appear_at=0.2)], plan
+    )
+    assert times[0] == pytest.approx(tx.FIRST_REVEAL_EARLIEST)
+    assert times[1] - times[0] >= 1.6 - 1e-6
+
+
+# ================================================================== type scale
+
+
+def test_the_type_scale_is_one_modular_ladder():
+    """DIRECTION §2: ratio 1.333, base = the bullet, and every size is a step on it."""
+    assert tx.TYPE_SCALE_RATIO == pytest.approx(4 / 3)
+    sizes = [tx.type_size(step, 1920) for step in (-1, 0, 1, 2, 3)]
+    assert sizes == [33, 44, 59, 78, 104]
+    for small, large in zip(sizes, sizes[1:], strict=False):
+        assert large / small == pytest.approx(4 / 3, abs=0.02)
+
+
+def test_the_bullet_clears_the_published_legibility_floors():
+    """40px is the 1080p body-text floor and 44px is the BBC HD accessibility floor. The
+    old 36px bullet was under both before ``SHRINK_STEPS`` was even involved."""
+    assert tx.type_size(tx.TYPE_STEP_BODY, 1920) >= 44
+    assert tx.type_size(tx.TYPE_STEP_BODY, 1920) / 1080 >= 1 / 27  # inside the EBU band
+
+
+def test_the_heading_is_at_least_half_again_the_bullet():
+    bullet = tx.type_size(tx.TYPE_STEP_BODY, 1920)
+    heading = tx.type_size(tx.TYPE_STEP_HEADING, 1920)
+    assert heading / bullet >= 1.5
+
+
+def test_the_scale_is_the_same_design_at_540p():
+    for step in (-1, 0, 1, 2, 3):
+        assert tx.type_size(step, 960) == pytest.approx(tx.type_size(step, 1920) / 2, abs=1)
+
+
+def test_a_video_has_exactly_two_heading_sizes():
+    """DIRECTION §9: the title card, and everything else. Four heading sizes is the
+    opposite of the uniformity that was asked for, and a 1.1x heading is a 7.8px difference
+    nobody can see that still moves the bullet baseline, which they can."""
+    sizes = {role: tx.heading_size_for(role, 1920) for role in SceneRole}
+    assert sizes[SceneRole.TITLE] == 105
+    assert (
+        sizes[SceneRole.CONTENT] == sizes[SceneRole.SUMMARY] == sizes[SceneRole.CLOSING] == 78
+    )
+    assert len(set(sizes.values())) == 2
 
 
 # ============================================================ slide layout plan
@@ -456,6 +534,139 @@ def test_bullet_times_respect_a_later_narration_cue():
 
 def layout(plan: VisualPlan, profile: RenderProfile = HD, **kwargs):
     return tx.layout_slide(HEADING, BULLETS, plan, profile, **kwargs)
+
+
+def hero(role: SceneRole, heading: str, points: list[str], **kwargs):
+    plan = VisualPlan(layout=SlideLayout.HERO_RIGHT, text_position=TextPosition.LEFT_PANEL)
+    bullets = [BulletPoint(text=t, appear_at=1.15 + 1.6 * i) for i, t in enumerate(points)]
+    return tx.layout_slide(heading, bullets, plan, HD, role=role, **kwargs)
+
+
+# DIRECTION-conforming copy: heading <= 22 chars, bullets <= 34 chars.
+SHORT_HEADING = "Inspect the sender"
+SHORT_BULLETS = [
+    "Check the real sender address",
+    "Hover a link before clicking",
+    "Treat urgency as a warning",
+    "Report it, never delete it",
+]
+
+
+def test_every_body_role_lands_on_the_same_grid():
+    """The rule that makes the deck read as one deck: content, summary and closing differ
+    only in how many bullets they carry. Nothing moves."""
+    content = hero(SceneRole.CONTENT, SHORT_HEADING, SHORT_BULLETS)
+    summary = hero(SceneRole.SUMMARY, "What to remember", SHORT_BULLETS)
+    closing = hero(SceneRole.CLOSING, "If in doubt, report", SHORT_BULLETS[:2])
+
+    for other in (summary, closing):
+        assert other.heading_size == content.heading_size
+        assert other.heading_rect.y == content.heading_rect.y
+        assert other.rule_rect == content.rule_rect
+        assert other.bullets[0].rect.y == content.bullets[0].rect.y
+        assert other.bullets[0].size == content.bullets[0].size
+    assert len(closing.bullets) == 2, "the closing earns its difference from having 2 points"
+
+
+def test_the_bullet_pitch_is_constant_and_a_wrap_pushes_the_stack_down():
+    slide = hero(SceneRole.CONTENT, SHORT_HEADING, SHORT_BULLETS)
+    tops = [b.rect.y for b in slide.bullets]
+    pitches = {b - a for a, b in zip(tops, tops[1:], strict=False)}
+    assert pitches == {84}, f"DIRECTION §3.3 pitch is 84px: {pitches}"
+
+    wrapped = hero(
+        SceneRole.CONTENT,
+        SHORT_HEADING,
+        ["Check the real sender address and then the reply-to as well", *SHORT_BULLETS[1:]],
+    )
+    assert len(wrapped.bullets[0].lines) == 2
+    # One line more, one line-height further down — never a collision.
+    assert wrapped.bullets[1].rect.y - wrapped.bullets[0].rect.y == 84 + wrapped.bullets[
+        0
+    ].line_height
+
+
+def test_the_first_bullet_does_not_move_when_a_heading_wraps():
+    """A variable heading line count is what put the bullet stack at three different heights
+    across four slides. The heading box is fixed and the type is bottom-aligned in it."""
+    one_line = hero(SceneRole.CONTENT, SHORT_HEADING, SHORT_BULLETS)
+    two_lines = hero(
+        SceneRole.CONTENT, "Recognise the pressure tactics attackers use", SHORT_BULLETS
+    )
+    assert len(one_line.heading_lines) == 1
+    assert len(two_lines.heading_lines) == 2
+
+    assert two_lines.rule_rect == one_line.rule_rect
+    assert two_lines.bullets[0].rect.y == one_line.bullets[0].rect.y
+    # The one-line heading is the one that carries the reserved air, above its type.
+    assert one_line.heading_offset_y == one_line.heading_line_height
+    assert two_lines.heading_offset_y == 0
+
+
+def test_the_accent_rule_is_one_fixed_width_everywhere_but_the_title_card():
+    body = [
+        hero(SceneRole.CONTENT, SHORT_HEADING, SHORT_BULLETS),
+        hero(SceneRole.SUMMARY, "What to remember", SHORT_BULLETS),
+        hero(SceneRole.CLOSING, "If in doubt, report", SHORT_BULLETS[:2]),
+    ]
+    assert {s.rule_rect.width for s in body} == {88}
+    assert {s.rule_rect.height for s in body} == {4}
+    title = tx.layout_slide(
+        "How phishing works", [], VisualPlan(layout=SlideLayout.TITLE_CARD), HD
+    )
+    assert title.rule_rect is not None
+    assert title.rule_rect.width == 120
+
+
+# ================================================================== title card
+
+
+def test_the_title_card_is_a_title_card_and_not_a_content_slide():
+    title = tx.layout_slide(
+        "How phishing works", BULLETS, VisualPlan(layout=SlideLayout.TITLE_CARD), HD
+    )
+    content = hero(SceneRole.CONTENT, SHORT_HEADING, SHORT_BULLETS)
+
+    assert title.geometry.role is SceneRole.TITLE, "a title_card layout implies the role"
+    assert title.bullets == [], "bullet_budget 0 — the opener earns its impact by having none"
+    assert title.geometry.align == "center"
+    assert title.heading_size > content.heading_size * 1.3
+    assert title.kicker == "TRAINING MODULE"
+    assert title.kicker_size == tx.type_size(tx.TYPE_STEP_KICKER, HD.width)
+    assert title.kicker_tracking > 0, "uppercase caps need tracking"
+    assert title.kicker_rect is not None
+    assert title.kicker_rect.bottom <= title.heading_rect.y + title.heading_line_height
+
+
+def test_the_title_block_is_optically_centred_not_top_anchored():
+    """The rejected opener top-anchored its block and left the bottom 55% of the frame
+    empty, which reads as a slide that failed to load."""
+    title = tx.layout_slide(
+        "How phishing works", [], VisualPlan(layout=SlideLayout.TITLE_CARD), HD
+    )
+    box = tx.Rect.union(title.text_rects)
+    assert box is not None
+    centre = box.y + box.height / 2
+    assert centre == pytest.approx(HD.height * tx.TITLE_OPTICAL_CENTRE_RATIO, abs=40)
+    assert centre < HD.height / 2, "optical centre sits above geometric centre"
+
+
+def test_a_role_never_moves_the_image_region():
+    """``ffmpeg_backend`` asks for the hero rectangle without knowing the role. If a role
+    moved it, the image and the rounded hole cut for it would land in different places."""
+    plan = VisualPlan(layout=SlideLayout.HERO_RIGHT)
+    regions = {
+        tx.slide_geometry(plan, HD, role=role).image_region.as_tuple() for role in SceneRole
+    }
+    assert len(regions) == 1
+    assert tx.image_region(plan, HD).as_tuple() == regions.pop()
+
+
+def test_the_bullet_budget_is_enforced_wherever_the_slide_is_built():
+    """Even if a script writes five points onto a closing scene."""
+    for role in SceneRole:
+        slide = hero(role, SHORT_HEADING, SHORT_BULLETS + ["A fifth point too many"])
+        assert len(slide.bullets) == role.bullet_budget
 
 
 @pytest.mark.parametrize("layout_kind", list(SlideLayout))
@@ -525,25 +736,48 @@ def test_every_word_on_the_slide_is_one_colour():
     assert theme.accent not in {b.text_colour for b in slide.bullets}
 
 
-def test_emphasis_survives_without_a_second_colour():
-    """Same ink, different weight/size/marker. Every signal here is non-chromatic."""
-    theme = Theme()
-    slide = layout(VisualPlan(layout=SlideLayout.HERO_RIGHT), theme=theme)
-    emphasised = [b for b in slide.bullets if b.emphasis][0]
-    normal = [b for b in slide.bullets if not b.emphasis][0]
+def test_emphasis_is_off_by_default_so_every_bullet_is_set_identically():
+    """The rejected build signalled emphasis three ways at once (size, weight, outline) and
+    it read as a font-substitution bug. Colour and marker shape are both off the table, and
+    a uniform list beats a hierarchy nobody notices — so the default is nothing at all."""
+    assert tx.EMPHASIS_MODE == "off"
+    slide = layout(VisualPlan(layout=SlideLayout.HERO_RIGHT), theme=Theme())
+    assert any(b.emphasis for b in slide.bullets), "test data must contain an emphasis flag"
 
-    assert emphasised.text_colour == normal.text_colour
-    # Weight: a genuinely heavier face when one exists, otherwise a faux-bold stroke.
+    assert len({b.text_colour for b in slide.bullets}) == 1
+    assert len({b.font for b in slide.bullets}) == 1
+    assert len({b.size for b in slide.bullets}) == 1
+    assert len({b.stroke_ratio for b in slide.bullets}) == 1
+    assert len({b.marker_shape for b in slide.bullets}) == 1
+    assert len({b.marker_diameter for b in slide.bullets}) == 1
+    assert len({b.indent for b in slide.bullets}) == 1
+    assert {b.faux_bold for b in slide.bullets} == {0.0}
+
+
+def test_weight_emphasis_changes_the_face_and_nothing_else():
+    """The one switchable emphasis. Measured at 1080p it is a 38% increase in ink mass —
+    visible, but it also reads as a different font and lands the baseline 8px low, which is
+    why it is opt-in. It must not touch a single other metric."""
+    slide = layout(VisualPlan(layout=SlideLayout.HERO_RIGHT), theme=Theme(), emphasis_mode="weight")
+    emphasised = next(b for b in slide.bullets if b.emphasis)
+    normal = next(b for b in slide.bullets if not b.emphasis)
+
     if tx.heavier_font(slide.font):
         assert emphasised.font != normal.font
         assert emphasised.faux_bold == 0.0
     else:
         assert emphasised.faux_bold > 0.0
-    assert emphasised.size > normal.size
-    assert emphasised.stroke_ratio > normal.stroke_ratio
-    # Shape: a filled disc against a hollow ring, in the same gutter.
-    assert emphasised.marker_filled and not normal.marker_filled
-    assert emphasised.marker_diameter > normal.marker_diameter
+    assert emphasised.text_colour == normal.text_colour
+    assert emphasised.size == normal.size
+    assert emphasised.stroke_ratio == normal.stroke_ratio
+    assert emphasised.marker_shape == normal.marker_shape
+    assert emphasised.marker_diameter == normal.marker_diameter
+    assert emphasised.indent == normal.indent
+
+
+def test_an_unknown_emphasis_mode_falls_back_to_off():
+    slide = layout(VisualPlan(layout=SlideLayout.HERO_RIGHT), emphasis_mode="rainbow")
+    assert len({b.font for b in slide.bullets}) == 1
 
 
 def test_markers_are_graphic_so_they_keep_the_accent_colour():
@@ -556,8 +790,23 @@ def test_markers_are_graphic_so_they_keep_the_accent_colour():
     assert len({b.indent for b in slide.bullets}) == 1
 
 
+@pytest.mark.parametrize("shape", list(tx.MARKER_SHAPES))
+def test_one_marker_shape_per_video_whatever_the_theme_asks_for(shape):
+    """`Theme.marker` is the only thing that decides the shape, and it decides it once."""
+    slide = layout(VisualPlan(layout=SlideLayout.HERO_RIGHT), theme=Theme(marker=shape))
+    assert {b.marker_shape for b in slide.bullets} == {shape}
+    # The gutter is a fixed 1.0 em, so the text edge does not move with the shape.
+    assert {b.indent for b in slide.bullets} == {slide.bullets[0].size}
+
+
+def test_an_unknown_marker_shape_falls_back_to_a_disc():
+    theme = Theme.model_construct(**{**Theme().model_dump(), "marker": "sparkle"})
+    slide = layout(VisualPlan(layout=SlideLayout.HERO_RIGHT), theme=theme)
+    assert {b.marker_shape for b in slide.bullets} == {"disc"}
+
+
 def test_uniform_text_is_switchable_back_to_accent_for_emphasis():
-    """`uniform_text=False` must reproduce the pre-brand-rule behaviour exactly."""
+    """`uniform_text=False` must reproduce the pre-brand-rule behaviour: colour only."""
     theme = Theme(uniform_text=False)
     slide = layout(VisualPlan(layout=SlideLayout.HERO_RIGHT), theme=theme)
     emphasised = [b for b in slide.bullets if b.emphasis]
@@ -566,15 +815,16 @@ def test_uniform_text_is_switchable_back_to_accent_for_emphasis():
 
     assert all(b.text_colour == theme.accent for b in emphasised)
     assert all(b.text_colour == theme.text for b in normal)
-    # ...and the geometry is left alone: colour was doing all the work.
+    # ...and the geometry is left alone, markers included: colour does all the work.
     assert {b.font for b in slide.bullets} == {slide.font}
     assert {b.size for b in slide.bullets} == {normal[0].size}
-    assert all(b.marker_filled for b in slide.bullets)
-    assert emphasised[0].marker_diameter > normal[0].marker_diameter
+    assert len({b.marker_shape for b in slide.bullets}) == 1
+    assert len({b.marker_diameter for b in slide.bullets}) == 1
 
 
 def test_centred_layouts_share_one_offset_so_the_stack_reads_as_a_block():
-    slide = layout(VisualPlan(layout=SlideLayout.TITLE_CARD))
+    # A centred *body* stack: the title card has no bullets at all (bullet_budget 0).
+    slide = layout(full_bleed(TextPosition.CENTER))
     assert slide.geometry.align == "center"
     assert len({b.offset_x for b in slide.bullets}) == 1
     assert slide.bullets[0].offset_x > 0
@@ -744,7 +994,7 @@ def test_no_glyph_is_clipped_by_its_own_canvas(tmp_path, profile):
     plan = VisualPlan(layout=SlideLayout.HERO_RIGHT)
     slide = tx.layout_slide(HEADING, BULLETS, plan, profile)
     scene = tx.build_scene_text(HEADING, BULLETS, plan, profile, tmp_path, slide=slide)
-    assert any(len(b.lines) > 2 for b in slide.bullets), "need a multi-line wrap to test"
+    assert any(len(b.lines) > 1 for b in slide.bullets), "need a multi-line wrap to test"
 
     for layer in scene.layers:
         if layer.kind == "scrim":
@@ -980,18 +1230,41 @@ def test_changing_the_text_changes_the_cache_key(tmp_path):
 
 
 @needs_magick
-def test_emphasis_and_profile_are_part_of_the_cache_key(tmp_path):
+def test_the_same_bullet_shares_a_png_whatever_its_emphasis_flag_says(tmp_path):
+    """The strongest possible statement of uniformity: with emphasis off, two bullets that
+    differ only in the flag are *the same file*. The profile still has to split them."""
     plan = VisualPlan(layout=SlideLayout.HERO_RIGHT)
     plain = tx.build_scene_text(HEADING, [BulletPoint(text="Same")], plan, HD, tmp_path)
-    accent = tx.build_scene_text(
+    flagged = tx.build_scene_text(
         HEADING, [BulletPoint(text="Same", emphasis=True)], plan, HD, tmp_path
     )
     draft = tx.build_scene_text(HEADING, [BulletPoint(text="Same")], plan, DRAFT, tmp_path)
-    paths = {
-        next(x for x in scene.layers if x.kind == "bullet").png_path
-        for scene in (plain, accent, draft)
-    }
-    assert len(paths) == 3
+
+    def bullet_png(scene):
+        return next(x for x in scene.layers if x.kind == "bullet").png_path
+
+    assert bullet_png(plain) == bullet_png(flagged)
+    assert bullet_png(draft) != bullet_png(plain)
+
+
+@needs_magick
+def test_weight_emphasis_is_part_of_the_cache_key(tmp_path):
+    """...but when it *is* switched on, two bullets differing only in weight must not
+    collide on one PNG."""
+    if tx.heavier_font(tx.find_font()) is None:
+        pytest.skip("no heavier face installed")
+    plan = VisualPlan(layout=SlideLayout.HERO_RIGHT)
+    plain = tx.build_scene_text(
+        HEADING, [BulletPoint(text="Same")], plan, HD, tmp_path, emphasis_mode="weight"
+    )
+    heavy = tx.build_scene_text(
+        HEADING, [BulletPoint(text="Same", emphasis=True)], plan, HD, tmp_path,
+        emphasis_mode="weight",
+    )
+    assert (
+        next(x for x in plain.layers if x.kind == "bullet").png_path
+        != next(x for x in heavy.layers if x.kind == "bullet").png_path
+    )
 
 
 def test_cache_key_is_stable_and_sensitive():
@@ -1298,61 +1571,112 @@ def test_a_blank_source_is_reported_as_no_logo(tmp_path):
 
 
 @needs_magick
-def test_a_normal_marker_is_hollow_and_an_emphasised_one_is_solid(tmp_path):
-    """The shape cue, measured: a ring has a transparent middle, a disc does not."""
-    slide = layout(VisualPlan(layout=SlideLayout.HERO_RIGHT))
-    scene = tx.build_scene_text(
-        HEADING, BULLETS, VisualPlan(layout=SlideLayout.HERO_RIGHT), HD, tmp_path, slide=slide
+@pytest.mark.parametrize("shape", ["dash", "disc", "ring", "chevron"])
+@pytest.mark.parametrize("theme_name", ["dark", "light"])
+def test_every_marker_in_a_scene_is_pixel_identical(tmp_path, shape, theme_name):
+    """The whole point of the change, measured on pixels.
+
+    Crop the marker's box out of every bullet layer and hash it. One hash means the ink is
+    identical byte for byte — same shape, same size, same position, same colour — including
+    on the bullet carrying ``emphasis=True``, which is what used to get a different shape.
+    """
+    theme = (
+        Theme(marker=shape)
+        if theme_name == "dark"
+        else Theme(marker=shape, bg="#F7F8FA", surface="#FFFFFF", text="#111827",
+                   muted="#55607A", accent="#1D4ED8")
     )
+    plan = VisualPlan(layout=SlideLayout.HERO_RIGHT)
+    slide = tx.layout_slide(HEADING, BULLETS, plan, HD, theme=theme)
+    scene = tx.build_scene_text(HEADING, BULLETS, plan, HD, tmp_path, theme=theme, slide=slide)
     layers = [x for x in scene.sorted_layers() if x.kind == "bullet"]
     binary = tx.require_imagemagick()
+    assert any(b.emphasis for b in slide.bullets)
 
+    digests, accents = set(), set()
     for block, layer in zip(slide.bullets, layers, strict=True):
-        cx = block.offset_x + max(block.marker_diameter // 2, block.indent // 2)
+        radius = max(2, block.marker_diameter // 2)
+        cx = block.offset_x + max(radius, block.indent // 2)
         cy = round(block.size * 0.52)
-        centre = subprocess.run(  # noqa: S603
-            [binary, str(layer.png_path), "-crop", f"1x1+{cx}+{cy}", "+repage",
-             "-alpha", "extract", "-format", "%[fx:maxima]", "info:"],
+        pad = radius + 6  # the ink plus its halo, and nothing of the text
+        box = f"{2 * pad}x{2 * pad}+{cx - pad}+{cy - pad}"
+        raw = subprocess.run(  # noqa: S603
+            [binary, str(layer.png_path), "-crop", box, "+repage", "-depth", "8", "RGBA:-"],
+            capture_output=True, check=True,
+        ).stdout
+        digests.add(hashlib.sha256(raw).hexdigest())
+        histogram = subprocess.run(  # noqa: S603
+            [binary, str(layer.png_path), "-crop", box, "+repage",
+             "-format", "%c", "histogram:info:"],
             capture_output=True, text=True, check=True,
-        ).stdout.strip()
-        ring_edge = subprocess.run(  # noqa: S603
-            [binary, str(layer.png_path),
-             "-crop", f"1x1+{cx}+{cy - max(2, block.marker_diameter // 2) + 1}", "+repage",
-             "-alpha", "extract", "-format", "%[fx:maxima]", "info:"],
-            capture_output=True, text=True, check=True,
-        ).stdout.strip()
-        assert float(ring_edge) > 0.5, "no marker ink at the rim"
-        if block.marker_filled:
-            assert float(centre) > 0.5, "emphasised marker should be a solid disc"
-        else:
-            assert float(centre) < 0.5, "normal marker should be a hollow ring"
+        ).stdout.upper()
+        accents.add(theme.accent.lstrip("#").upper() in histogram)
+
+    assert len(digests) == 1, f"{len(digests)} different markers in one stack"
+    assert accents == {True}, "a marker is missing its accent ink"
 
 
 @needs_magick
-def test_an_emphasised_bullet_carries_more_ink_than_a_normal_one(tmp_path):
-    """Weight, measured on pixels rather than asserted from a font name."""
-    slide = layout(VisualPlan(layout=SlideLayout.HERO_RIGHT))
-    emph = next(b for b in slide.bullets if b.emphasis)
-    normal = next(b for b in slide.bullets if not b.emphasis)
+def test_the_marker_gutter_is_the_only_place_accent_ink_appears_in_a_bullet(tmp_path):
+    """`uniform_text` in pixels: the words are one colour and it is never the accent."""
+    theme = Theme()
+    plan = VisualPlan(layout=SlideLayout.HERO_RIGHT)
+    slide = tx.layout_slide(HEADING, BULLETS, plan, HD, theme=theme)
+    scene = tx.build_scene_text(HEADING, BULLETS, plan, HD, tmp_path, theme=theme, slide=slide)
+    binary = tx.require_imagemagick()
+    accent = theme.accent.lstrip("#").upper()
+
+    for block, layer in zip(
+        slide.bullets, [x for x in scene.sorted_layers() if x.kind == "bullet"], strict=True
+    ):
+        text_only = (
+            f"{block.rect.width - block.offset_x - block.indent}x{block.rect.height}"
+            f"+{block.offset_x + block.indent}+0"
+        )
+        histogram = subprocess.run(  # noqa: S603
+            [binary, str(layer.png_path), "-crop", text_only, "+repage",
+             "-format", "%c", "histogram:info:"],
+            capture_output=True, text=True, check=True,
+        ).stdout.upper()
+        assert accent not in histogram, "accent ink found in the text column"
+        assert theme.text.lstrip("#").upper() in histogram, "text is not `theme.text`"
+
+
+@needs_magick
+def test_weight_emphasis_is_visible_but_costs_the_baseline(tmp_path):
+    """Why emphasis defaults to off, measured rather than asserted.
+
+    A heavier face *is* visible — 35%+ more ink for the same words at the same size. But
+    ImageMagick lays a block out from the face's own ascent, so the heavier face's first
+    baseline lands several pixels lower for an identical ``-annotate`` origin: the one
+    emphasised line sits off the rhythm of the stack around it. Visible, and visible as a
+    rendering fault rather than as hierarchy — which is exactly the complaint.
+    """
+    base = tx.find_font()
+    heavier = tx.heavier_font(base)
+    if heavier is None:
+        pytest.skip("no heavier face installed")
     binary = tx.require_imagemagick()
 
-    def ink_mass(block) -> float:
-        text_file = tx.write_text_file(tmp_path, f"w{block.emphasis}.txt", ["Handgloves"])
-        out = tmp_path / f"w{block.emphasis}.png"
+    def render(font: str) -> tuple[float, int]:
+        text_file = tx.write_text_file(tmp_path, "w.txt", ["Treat urgency as a warning"])
+        out = tmp_path / f"{Path(font).stem}.png"
         subprocess.run(  # noqa: S603
-            [binary, "-size", "800x160", "xc:none", "-font", block.font,
-             "-pointsize", str(block.size), "-gravity", "northwest", "-fill", "white",
-             "-annotate", "+10+10", tx.imagemagick_text_arg(text_file), f"PNG32:{out}"],
+            [binary, "-size", "1200x160", "xc:none", "-font", font, "-pointsize", "44",
+             "-gravity", "northwest", "-fill", "white", "-annotate", "+10+10",
+             tx.imagemagick_text_arg(text_file), f"PNG32:{out}"],
             check=True,
         )
-        return float(subprocess.run(  # noqa: S603
+        mass = float(subprocess.run(  # noqa: S603
             [binary, str(out), "-alpha", "extract", "-format", "%[fx:mean*w*h]", "info:"],
             capture_output=True, text=True, check=True,
         ).stdout.strip())
+        return mass, ink_bbox(out)[3]
 
-    heavy, light = ink_mass(emph), ink_mass(normal)
-    # Same word, same colour: the only thing that changed is how much ink is on the page.
-    assert heavy > light * 1.15, f"emphasis barely reads: {heavy} vs {light}"
+    heavy_mass, heavy_top = render(heavier)
+    light_mass, light_top = render(base)
+    assert heavy_mass > light_mass * 1.15, f"weight barely reads: {heavy_mass} vs {light_mass}"
+    assert heavy_top > light_top, "expected the heavier face to sit lower in its canvas"
 
 
 def test_available_fonts_are_all_real_files():

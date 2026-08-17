@@ -785,3 +785,16 @@ def test_engine_is_reported_in_the_job_list(client: TestClient) -> None:
     client.post("/api/jobs", json={"topic": "A", "tts_engine": "polly"})
     rows = client.get("/api/jobs").json()
     assert rows[0]["tts_engine"] == "polly"
+
+
+def test_polly_fallback_is_never_empty_for_an_odd_tier(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty picker is a worse failure than an unfiltered one."""
+    monkeypatch.setattr(voices_api, "_polly_provider_voices", lambda tier: None)
+    for tier in ("auto", "wobble", ""):
+        monkeypatch.setattr(get_settings(), "video_polly_engine", tier)
+        voices_api.reset_cache()
+        body = client.get("/api/voices?engine=polly").json()
+        assert body, tier
+        assert get_settings().video_default_polly_voice in [v["id"] for v in body]
