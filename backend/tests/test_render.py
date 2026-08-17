@@ -2445,8 +2445,10 @@ def test_a_looped_clip_never_freezes_and_never_repeats_a_frame_at_the_seam(tmp_p
     )
 
     ratio = _duplicate_ratio(clip)
-    # 24 -> 30 fps repeats one frame in five, so ~0.20 is the floor for any clip scene.
-    assert ratio < 0.34, f"the scene freezes or judders somewhere: {ratio:.3f}"
+    # Measured floor for any clip scene: the 24 -> 30 fps resample alone contributes
+    # 34/240 = 14.2% on this fixture, and the whole looped 20s scene measures ~11%.
+    # A final-frame hold would put 12 of the 20 seconds at 100%, i.e. ~0.60 overall.
+    assert ratio < 0.25, f"the scene freezes or judders somewhere: {ratio:.3f}"
 
     # And specifically: nothing is frozen *past the 8s mark*, which is exactly where a
     # final-frame hold would park for the remaining 12 seconds.

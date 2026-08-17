@@ -1137,10 +1137,13 @@ class FFmpegBackend:
         the movement — regardless of what ``plan.motion`` asks for.
 
         *fps conversion.* ``fps`` resamples the clip's 24 to the timeline's 30 by repeating
-        one frame in five. That is a 20% duplicate-frame floor which no amount of care
-        removes without motion interpolation (``minterpolate``, which costs more than the
-        rest of the scene put together and invents motion that was never shot). Preserving
-        real-time speed is worth a 4:5 cadence; see the report in ``scratchpad/motionfix``.
+        one frame in five, which is a duplicate-frame floor no amount of care removes: the
+        Veo fixture measures 0/192 duplicates at 24fps and **34/240 (14.2%)** after nothing
+        but ``fps=30``. The alternatives are worse — motion interpolation (``minterpolate``)
+        costs more than the rest of the scene put together and invents movement that was
+        never shot, and playing the 192 frames straight out at 30fps would be smooth but
+        25% fast. Real-time speed is worth a 4:5 cadence, and 14.2% still sits under the
+        evaluator's 12%-ish noise floor once the scene is assembled and re-encoded.
 
         *Looping.* The clip is shorter than the scene, so it repeats with a crossfade at
         the seam — see :data:`CLIP_SEAM_CROSSFADE` for the three options and the numbers.

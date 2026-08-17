@@ -209,6 +209,15 @@ export function evaluateLogoContrast(
  */
 export const BUILT_IN_MARK_COLOUR = '#863BFF'
 
+/**
+ * The built-in mark, previewable because it is a real asset in `public/`.
+ *
+ * Not a stand-in: `resolve_logo_source()` falls back to
+ * `REPO_ROOT / "frontend/public/favicon.svg"`, so this is the same file the
+ * renderer rasterises when no logo is chosen and `VIDEO_LOGO_PATH` is unset.
+ */
+export const BUILT_IN_LOGO_URL = '/favicon.svg'
+
 /* ------------------------------------------------------------------ *
  * Pre-flight inspection
  *
@@ -381,6 +390,35 @@ function samplePixels(image: HTMLImageElement, width: number, height: number): P
         ? null
         : toHex({ r: best.r / best.count, g: best.g / best.count, b: best.b / best.count }),
   }
+}
+
+export interface ImageSample {
+  width: number | null
+  height: number | null
+  hasAlpha: boolean | null
+  meanAlpha: number | null
+  dominant: string | null
+}
+
+/**
+ * Measures an already-stored mark from its URL — the same sampling the uploader
+ * does on a local file.
+ *
+ * Used for the selected logo's contrast note, including the built-in mark
+ * (`/favicon.svg`, which is what the renderer resolves as its default source).
+ * The server does not report a dominant colour, so it is measured here rather
+ * than assumed. Resolves `null` when the image cannot be read: same-origin
+ * assets are fine, but a canvas tainted by anything external is a security
+ * error, not a logo problem.
+ */
+export async function sampleImageUrl(url: string): Promise<ImageSample | null> {
+  const image = await decodeImage(url)
+  if (image === null) return null
+  const width = image.naturalWidth > 0 ? image.naturalWidth : null
+  const height = image.naturalHeight > 0 ? image.naturalHeight : null
+  const stats = samplePixels(image, width ?? 256, height ?? 256)
+  if (stats === null) return { width, height, hasAlpha: null, meanAlpha: null, dominant: null }
+  return { width, height, ...stats }
 }
 
 /**

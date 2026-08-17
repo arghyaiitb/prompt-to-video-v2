@@ -96,6 +96,32 @@ def test_create_job_defaults_voice_from_settings(client: TestClient) -> None:
     assert get_settings().video_default_tts_voice
 
 
+def test_a_job_created_without_a_logo_id_keeps_the_bundled_mark(client: TestClient) -> None:
+    """The default-preservation contract: an untouched request renders as it always did.
+
+    `logo_id: null` is what "the bundled mark" looks like on the wire, and it is what every
+    row created before uploads existed holds. See test_logos.py for the upload surface.
+    """
+    job_id = client.post("/api/jobs", json={"topic": "Tides", "slide_count": 2}).json()["job_id"]
+    body = client.get(f"/api/jobs/{job_id}").json()
+    assert body["logo_id"] is None
+    assert body["logo_url"] is None
+    assert client.get("/api/jobs").json()[0]["logo_id"] is None
+
+
+def test_an_unknown_logo_id_does_not_silently_fall_back(client: TestClient) -> None:
+    response = client.post(
+        "/api/jobs", json={"topic": "Tides", "slide_count": 2, "logo_id": "deadbeef" * 4}
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"]["error"] == "unknown_logo"
+    assert client.get("/api/jobs").json() == []
+
+
+def test_the_logo_catalogue_is_empty_until_something_is_uploaded(client: TestClient) -> None:
+    assert client.get("/api/logos").json() == []
+
+
 @pytest.mark.parametrize("slide_count", [1, 0, 11, -3])
 def test_slide_count_out_of_range_is_rejected(client: TestClient, slide_count: int) -> None:
     response = client.post("/api/jobs", json={"topic": "Bees", "slide_count": slide_count})

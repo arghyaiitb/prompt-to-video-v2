@@ -7,6 +7,7 @@ import {
 } from 'lucide-react'
 
 import { EngineBadge } from '@/components/EngineBadge'
+import { LogoBadge } from '@/components/LogoBadge'
 import { ThemeBadge } from '@/components/ThemeBadge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -15,6 +16,7 @@ import { formatAbsoluteTime, formatRelativeTime } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import {
   STAGE_LABELS,
+  type BrandLogo,
   type Job,
   type JobStatus,
   type SpeechEngine,
@@ -25,6 +27,8 @@ interface JobHistoryProps {
   jobs: Job[]
   themes: ThemePreset[]
   engines: SpeechEngine[]
+  logos: BrandLogo[]
+  logoNoneValue: string
   isLoading: boolean
   error: string | null
   activeJobId: string | null
@@ -52,6 +56,8 @@ export function JobHistory({
   jobs,
   themes,
   engines,
+  logos,
+  logoNoneValue,
   isLoading,
   error,
   activeJobId,
@@ -167,6 +173,7 @@ export function JobHistory({
                       )}
                       <ThemeBadge job={job} themes={themes} small />
                       <EngineBadge job={job} engines={engines} small />
+                      <LogoBadge job={job} logos={logos} noneValue={logoNoneValue} small />
                     </div>
                   </div>
                 </div>

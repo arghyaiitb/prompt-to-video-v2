@@ -7,6 +7,7 @@ import {
 } from 'lucide-react'
 
 import { EngineBadge } from '@/components/EngineBadge'
+import { LogoBadge } from '@/components/LogoBadge'
 import { SceneInspector } from '@/components/SceneInspector'
 import { SceneSeekList } from '@/components/SceneSeekList'
 import { ThemeBadge } from '@/components/ThemeBadge'
@@ -15,6 +16,7 @@ import { toFilename } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import {
   TONE_OPTIONS,
+  type BrandLogo,
   type Job,
   type SpeechEngine,
   type ThemePreset,
@@ -25,6 +27,8 @@ interface ResultViewProps {
   job: Job
   themes: ThemePreset[]
   engines: SpeechEngine[]
+  logos: BrandLogo[]
+  logoNoneValue: string
   timeline: Timeline | null
   timelineLoading: boolean
   timelinePending: boolean
@@ -37,6 +41,8 @@ export function ResultView({
   job,
   themes,
   engines,
+  logos,
+  logoNoneValue,
   timeline,
   timelineLoading,
   timelinePending,
@@ -84,6 +90,9 @@ export function ResultView({
             report these fields — older ones omit them entirely. */}
         <div className="flex flex-wrap items-center gap-2">
           <ThemeBadge job={job} themes={themes} />
+          {/* The mark burnt into the bottom-left of every frame. Shown next to
+              the palette because they are the two branding decisions. */}
+          <LogoBadge job={job} logos={logos} noneValue={logoNoneValue} />
           {/* Engine and voice sit next to each other: the voice id only means
               anything in the context of the engine that produced it. */}
           <EngineBadge job={job} engines={engines} />

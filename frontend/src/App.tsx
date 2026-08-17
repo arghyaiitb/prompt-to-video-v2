@@ -11,11 +11,22 @@ import { Toaster } from '@/components/ui/sonner'
 import { useEngines } from '@/hooks/useEngines'
 import { useJobHistory } from '@/hooks/useJobHistory'
 import { useJobPolling } from '@/hooks/useJobPolling'
+import { useLogos } from '@/hooks/useLogos'
 import { useThemes } from '@/hooks/useThemes'
 import { useTimeline } from '@/hooks/useTimeline'
 import { useVoices } from '@/hooks/useVoices'
-import { createJob, ThemeContrastError, VoiceEngineMismatchError } from '@/lib/api'
-import { OPTIONAL_FIELD_LABELS, type CreateJobRequest, type ThemeContrastFailure } from '@/lib/types'
+import {
+  createJob,
+  LogoRejectedError,
+  ThemeContrastError,
+  VoiceEngineMismatchError,
+} from '@/lib/api'
+import {
+  OPTIONAL_FIELD_LABELS,
+  type CreateJobRequest,
+  type LogoRejection,
+  type ThemeContrastFailure,
+} from '@/lib/types'
 
 /** `?job=<id>` opens straight into that job — handy for sharing a render. */
 function initialJobId(): string | null {
@@ -32,6 +43,12 @@ export default function App() {
    * corrected palette the "Fix contrast" button applies.
    */
   const [contrastFailure, setContrastFailure] = useState<ThemeContrastFailure | null>(null)
+  /**
+   * The server refusing our `logo_id`. Held here for the same reason as the
+   * contrast failure: it arrives with a submission and belongs beside the picker,
+   * not in a toast that scrolls away.
+   */
+  const [logoRejection, setLogoRejection] = useState<LogoRejection | null>(null)
 
   // The engine drives the voice request, so it is resolved before `useVoices`.
   const {
@@ -52,6 +69,7 @@ export default function App() {
     isLoading: themesLoading,
     usedFallback: usedFallbackThemes,
   } = useThemes()
+  const logoState = useLogos()
   const { job, isLoading: jobLoading, error: pollError, refresh } = useJobPolling(activeJobId)
   const { jobs, isLoading: historyLoading, error: historyError, reload } = useJobHistory()
 
@@ -83,6 +101,7 @@ export default function App() {
     (request: CreateJobRequest) => {
       setIsSubmitting(true)
       setContrastFailure(null)
+      setLogoRejection(null)
       void createJob(request)
         .then((response) => {
           setActiveJobId(response.job_id)
@@ -119,6 +138,23 @@ export default function App() {
             })
             return
           }
+          /*
+           * The logo 422 is surfaced, never worked around. `createJob` could
+           * have dropped `logo_id` and succeeded, but the video that came back
+           * would carry the built-in mark — either instead of the customer's
+           * logo or in place of the "no logo" they chose. That is the engine
+           * lesson applied: a retry that strips a field silently renders
+           * something nobody asked for.
+           */
+          if (cause instanceof LogoRejectedError) {
+            setLogoRejection(cause.rejection)
+            toast.error('That brand logo was rejected', {
+              description: cause.rejection.unsupported
+                ? 'This backend has no brand-logo support yet. Choose the built-in mark to continue — nothing was started.'
+                : cause.rejection.message,
+            })
+            return
+          }
           // The voice/engine pair is derived, so this should be unreachable —
           // it means the UI and server disagree about which engine owns a
           // voice. Named explicitly so that shows up as a bug, not as noise.
@@ -142,6 +178,38 @@ export default function App() {
   const dismissContrastFailure = useCallback(() => {
     setContrastFailure(null)
   }, [])
+
+  /** The rejection belongs to the logo that caused it, not to the next one. */
+  const selectLogo = useCallback(
+    (selection: string) => {
+      setLogoRejection(null)
+      logoState.select(selection)
+    },
+    [logoState],
+  )
+
+  const uploadLogoFile = useCallback(
+    async (file: File) => {
+      setLogoRejection(null)
+      const logo = await logoState.upload(file)
+      if (logo !== null) {
+        toast.success('Logo uploaded', {
+          description:
+            logo.warning ??
+            `It will be composited bottom-left at 49px. Check the preview before you generate.`,
+        })
+      }
+      return logo
+    },
+    [logoState],
+  )
+
+  const removeLogo = useCallback(
+    (logoId: string) => {
+      void logoState.remove(logoId)
+    },
+    [logoState],
+  )
 
   const handleReset = useCallback(() => {
     setActiveJobId(null)
@@ -197,6 +265,17 @@ export default function App() {
                   usedFallbackThemes={usedFallbackThemes}
                   contrastFailure={contrastFailure}
                   onDismissContrastFailure={dismissContrastFailure}
+                  logos={logoState.logos}
+                  logosLoading={logoState.isLoading}
+                  logosAvailable={logoState.available}
+                  logoNoneValue={logoState.noneValue}
+                  logoSelection={logoState.selection}
+                  onSelectLogo={selectLogo}
+                  onRemoveLogo={removeLogo}
+                  logoUploadProgress={logoState.uploadProgress}
+                  logoUploadError={logoState.uploadError}
+                  onUploadLogo={uploadLogoFile}
+                  logoRejection={logoRejection}
                   isSubmitting={isSubmitting}
                   onSubmit={handleSubmit}
                 />
@@ -230,6 +309,8 @@ export default function App() {
                   job={job}
                   themes={themes}
                   engines={engines}
+                  logos={logoState.logos}
+                  logoNoneValue={logoState.noneValue}
                   timeline={timeline}
                   timelineLoading={timelineLoading}
                   timelinePending={timelinePending}
@@ -259,6 +340,8 @@ export default function App() {
               jobs={jobs}
               themes={themes}
               engines={engines}
+              logos={logoState.logos}
+              logoNoneValue={logoState.noneValue}
               isLoading={historyLoading}
               error={historyError}
               activeJobId={activeJobId}

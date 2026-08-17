@@ -37,7 +37,7 @@ system passes ad-hoc tuples between stages; every stage reads a `Timeline` and r
 | `backend/app/core/themes.py` | 8 validated palettes + the WCAG gate (`validate_theme`, `review_theme`, `suggest_fix`) |
 | `backend/app/worker/pipeline.py` | The orchestrator. `run_job(job_id)` and the 8 stages |
 | `backend/app/worker/factory.py` | Provider resolution. Every import is lazy, inside a function |
-| `backend/app/api/` | FastAPI routers: `jobs.py`, `themes.py`, `engines.py`, `voices.py` |
+| `backend/app/api/` | FastAPI routers: `jobs.py`, `themes.py`, `engines.py`, `voices.py`, `logos.py` |
 | `backend/app/db/` | `Job` row (SQLModel), SQLite engine, WAL pragmas, additive migration |
 | `backend/app/providers/` | Concrete adapters: Gemini, Deepgram, Polly, Lyria, Veo + `bullet_timing.py`, `ssml.py` |
 | `backend/app/render/` | `planner.py` (pure), `ffmpeg_backend.py` (execution), `text_overlay.py` (rasterisation), `contracts.py` (the seam), `ffmpeg.py` (subprocess), `captions.py` |
@@ -58,6 +58,7 @@ Timeline
 ├── job_id, topic, title, voice
 ├── language: Language = EN          # defined, NOT plumbed — see §13
 ├── music_path: str | None
+├── logo_path: str | None            # per-job brand mark, overrides settings
 ├── profile: RenderProfile           # 1920x1080@30, crf 18, upscale_factor 4
 ├── theme: Theme                     # persisted so a re-render reproduces branding
 └── scenes: list[Scene]
@@ -572,7 +573,11 @@ fade-up and the closing fade-out, and "constant" is the requirement. The logo is
 input** relying on `overlay`'s default `eof_action=repeat`, rather than a `-loop 1` stream in a
 pass with no `-frames:v` to stop it. `resolve_logo_source` is three-way (`AUTO_LOGO` → settings →
 `frontend/public/favicon.svg`; `None` or an empty-ish path → no branding; a real path → use it or
-warn and skip) and a missing logo is **never** an error. `logo_conflicts` reports scenes whose
+warn and skip) and a missing logo is **never** an error — the same three states
+`Timeline.logo_path` and `Job.logo_id` carry, which is what lets a per-job upload flow straight
+through. `pipeline._stage_render` passes it by inspecting the factory's signature and falls back to
+assigning `backend.logo_source` directly, warning if the backend takes no mark at all.
+`logo_conflicts` reports scenes whose
 *ink* (not layer canvas) would overlap the mark, and reports rather than resolves — nudging the
 logo per scene would make it move, which is exactly what a persistent brand mark must not do.
 
@@ -635,9 +640,9 @@ Read `ffmpeg_backend.py:77-208` for the full derivation — every constant there
 measured justification. The two-sentence version, because the shape of the fix is what matters:
 
 1. **Quantisation.** `zoompan` truncates `x`/`y` and its crop size to whole **input canvas**
-   pixels, so its finest move lands on screen as `zoom / U` output pixels. `upscale_factors`
-   derives `U` from the region, the travel distance and the frame count rather than using a fixed
-   4 (which was calibrated when zoompan filled a 1920-wide frame, not a 720-wide panel).
+   pixels, so its finest move lands on screen as `zoom / U` output pixels. `motion_canvas()`
+   derives the canvas from the region, the travel distance and the frame count rather than using a
+   fixed 4 (which was calibrated when zoompan filled a 1920-wide frame, not a 720-wide panel).
    `CANVAS_STEP_TARGET = 1.0` is the physics, not a knob: below one canvas pixel per frame the
    render *will* emit byte-identical frames. `CANVAS_PIXEL_BUDGET = 24M` is where the honest
    compromise lives, and `slowest_step()` is the number to argue with.
@@ -646,13 +651,40 @@ measured justification. The two-sentence version, because the shape of the fix i
    `eased_progress` blends in a linear ramp with `EASE_VELOCITY_FLOOR = 0.20`, swept over seven
    real layout/motion pairs; it is the larger of the two effects and it costs nothing.
 
-The canvas is deliberately **anamorphic** — a pan travels only horizontally, so only that axis
-needs a fine integer grid, and zoompan crops proportionally to its input so the stretch is exactly
-un-squeezed on the way out. Measured on `hero_right`/`pan_right`, 604 frames, 1080p: the old fixed
-4×4 canvas (3424×3264) gave a **46.67%** duplicate-frame ratio in 7.74 s; an isotropic 16× canvas
-gave **13.33%** but took 64.04 s; the anamorphic 13696×1632 canvas gives **11.67%** in **7.57 s** —
-same smoothness as the isotropic version for an eighth of the time, and no dearer than the canvas
-it replaces.
+`motion_canvas(plan, region, frames, profile, src_size) -> MotionCanvas` balances three
+requirements that pull against each other, and it is worth reading its docstring because an earlier
+draft got one of them wrong. `MotionCanvas` carries `fit` (the isotropic `region * detail` target
+where lanczos runs), `canvas` (what zoompan actually reads, after a cheap anamorphic stretch) and
+`detail`:
+
+1. **No resolution loss.** zoompan crops `canvas/zoom` and scales it to the region, so
+   `canvas >= region * zoom` on **both** axes or the crop is itself an upscale and the panel is
+   measurably softer than the still it came from. The earlier draft worked in integer multiples of
+   the region, so the only options were 1× (which upscales, since `zoom > 1`) and 2× (twice the
+   area). Sizing in *pixels* makes 1.08× reachable. `plan_zoom_ceiling(plan)` supplies the zoom.
+2. **Positional precision** on the travel axis — `canvas/region` sub-steps per output pixel.
+3. **Cost**, budgeted as **area**, not factor.
+
+So the cross axis takes the least it can get away with and the travel axis spends the remainder.
+Nothing is distorted: the still is cover-fitted to the region's aspect first, so its net scale
+through the stretch and back out of zoompan is `region * zoom / fit` on each axis, and `fit` has
+the region's aspect, so the two are equal by construction.
+
+Measured on `hero_right`/`pan_right` at 1080p over 604 frames, in the evaluator's own 4 s window:
+
+| canvas | duplicate ratio | render |
+|---|---|---|
+| 2880×3600 (old, fixed 4×4) | 51.67% | 5.70 s |
+| 11520×14400 (isotropic 16×) | ~13% | ~64 s |
+| **13332×1800 (this)** | **4.17%** | **9.02 s** |
+
+The isotropic canvas that reaches the same smoothness is seven times the pixels and seven times the
+time. And because the budget is an area, the derivation makes `full_bleed` **cheaper** than the
+fixed 4× it replaces (24 vs 33 Mpixels) while taking it from 30.83% duplicates to under 2%. A pan's
+cross factor is exactly `detail_upscale` and not a pixel more — measured on
+`full_bleed`/`pan_left`, a cross factor of 2 gave 9600×2160 and 19.17% duplicates, while spending
+the same ~23M pixels on the axis that moves (21120×1080) gave **3.33%**. A zoom cannot do that: its
+binding constraint is whichever axis steps last, so `ZOOM_CROSS_UPSCALE = 4` is the measured knee.
 
 Note the planner currently defaults to `easing="linear"` (per DIRECTION §4.4) with
 `HELD_ZOOM_SPAN = 0.06` — 6% over 15 s, i.e. 0.4%/s: never static, never noticed.
@@ -693,6 +725,7 @@ One table, `job`, one row per render. `backend/videos.db`, SQLite.
 | `theme_custom` | `str \| None` | `None` — JSON palette blob |
 | `bullets_per_slide` | `int` | `4` |
 | `tone` | `str \| None` | `None` |
+| `logo_id` | `str \| None` | `None` — an id from `POST /api/logos`, or `"none"` |
 | `status` | `str` | `"queued"`, **indexed** |
 | `progress`, `current_stage`, `error` | `int`, `str?`, `str?` | `0`, `None`, `None` |
 | `timeline_json` | `str \| None` | `None` — **the debug trail** |
@@ -709,7 +742,8 @@ raising — a debug aid must not break a status response.
 **The migration.** `db/models.migrate(engine)` exists because `SQLModel.metadata.create_all`
 creates missing *tables* only and **never alters one that already exists**. A dev database from a
 previous release would keep its old table and every INSERT would fail with *"table job has no
-column named theme"*. So `_ADDED_COLUMNS` lists five post-release columns with their DDL, and
+column named theme"*. So `_ADDED_COLUMNS` lists the post-release columns with their DDL — `theme`,
+`theme_custom`, `bullets_per_slide`, `tone`, `tts_engine`, `logo_id` — and
 `migrate` reads `PRAGMA table_info('job')`, skips whatever is present, and `ALTER TABLE job ADD
 COLUMN`s the rest inside one transaction. It is idempotent and purely additive, returns the names
 it added, and is run on **every** startup from `init_db()`. No rows exist yet → it returns `[]`
@@ -741,7 +775,7 @@ the Vite dev server; there is no static file mounting and no custom exception ha
 
 | Method | Path | Notes |
 |---|---|---|
-| `POST` | `/api/jobs` | **202**. `topic` (≤500), `slide_count` 2–10, `voice`, `music`, `tts_engine`, `theme`, `theme_custom`, `bullets_per_slide` 3–5, `tone` ∈ {new_hires, all_staff, technical, executives} |
+| `POST` | `/api/jobs` | **202**. `topic` (≤500), `slide_count` 2–10, `voice`, `music`, `tts_engine`, `theme`, `theme_custom`, `bullets_per_slide` 3–5, `tone` ∈ {new_hires, all_staff, technical, executives}, `logo_id` |
 | `GET` | `/api/jobs` | `ORDER BY created_at DESC, id DESC LIMIT 20` |
 | `GET` | `/api/jobs/{id}` | `JobStatusOut` |
 | `GET` | `/api/jobs/{id}/timeline` | raw `Timeline` dump, 404 if none recorded yet |
@@ -750,16 +784,45 @@ the Vite dev server; there is no static file mounting and no custom exception ha
 | `GET` | `/api/engines` | id, name, `supports_ssml`, `available`, `default`, `default_voice`, `reason` |
 | `GET` | `/api/themes` | id, name, description, `is_light`, `is_default`, swatches, **computed** contrast |
 | `GET` | `/api/voices?engine=` | id, name, accent, tags, use_cases. Unknown engine → **422** |
+| `POST` | `/api/logos` | **201**. Multipart upload of a brand mark. See below |
+| `GET` | `/api/logos` | stored marks |
+| `GET` | `/api/logos/{id}`, `/{id}/render`, `/{id}/meta` | original file, rasterised render asset, metadata |
+| `DELETE` | `/api/logos/{id}` | **204**, or **409** while a job still names it |
 | `GET` | `/api/health` | `{"status":"ok"}` |
 
-Two resolution rules are worth internalising because they differ deliberately
-(`api/jobs.py:151-214`). An unknown **theme** or **engine** id is *normalised* to the default and
-the *resolved* value is what gets stored, so a row never claims a palette or engine that was not
-used. But a **voice** that demonstrably belongs to a different engine is **rejected with 422**,
-not substituted — it is always a client bug (the voice list is served per engine by this same
-API), and silently substituting one ships a six-minute video in a voice nobody chose. A custom
-palette failing WCAG **AA** is also a 422, and the body carries `suggested_fix` +
-`suggested_contrast` so the UI can offer one-click correction instead of a dead end.
+Three resolution rules are worth internalising because they differ deliberately. An unknown
+**theme** or **engine** id is *normalised* to the default and the *resolved* value is what gets
+stored, so a row never claims a palette or engine that was not used. But a **voice** that
+demonstrably belongs to a different engine is **rejected with 422**, not substituted — it is always
+a client bug (the voice list is served per engine by this same API), and silently substituting one
+ships a six-minute video in a voice nobody chose. Likewise an unknown **`logo_id`** is a 422
+(`_resolve_logo_id`), because a missing logo would degrade to a video branded with somebody else's
+mark — the one outcome an upload feature exists to prevent. A custom palette failing WCAG **AA** is
+also a 422, and the body carries `suggested_fix` + `suggested_contrast` so the UI can offer
+one-click correction instead of a dead end.
+
+`logo_id` is three-state throughout, mirroring `resolve_logo_source`'s own three states: omitted →
+the bundled default mark; `"none"` → no branding; an id → that upload. `pipeline.resolve_job_logo`
+turns the id into `Timeline.logo_path`, and an id whose file has since been deleted falls back to
+the default with a warning rather than failing the render.
+
+**The logo store** (`app/api/logos.py`) is the only endpoint that takes an untrusted *file* and
+hands it to image tooling, and its validation is correspondingly paranoid — each rule states its
+threat. The size cap (`settings.video_logo_max_bytes`, 4 MiB) is enforced **chunk by chunk while
+the body arrives**, because a cap applied after buffering only limits what you keep. Format comes
+from PNG magic bytes and from whether the document actually parses as XML with an `<svg>` root; the
+filename and `Content-Type` choose only which diagnostic to return. Dimensions are read from the
+PNG IHDR and from the SVG's own `width`/`height`/`viewBox` — **parsed, not decoded** — so a 40 KB
+file that expands to 99999×99999 is rejected having never allocated a bitmap. The stored name is a
+content hash, so `../../etc/x.png` is never a path that could reach the filesystem, and lookups
+re-validate against `LOGO_ID_RE`. SVGs are rasterised **at upload time**, because ImageMagick on
+this box has no `rsvg-convert` delegate and its built-in MSVG renderer implements neither `<mask>`
+nor `<filter>` — turning such groups into black blobs, which is exactly the shape of the app's own
+favicon. Anything the renderer cannot be faithful to comes back as a `warnings` entry on the upload
+response rather than being discovered in a finished video. Metadata lives in a JSON sidecar next to
+the file rather than a table, so `cache/logos` is self-describing and can be copied or wiped as a
+unit; the only relational fact is `Job.logo_id`, which is what makes DELETE a **409** while a job
+still names it.
 
 `GET /api/voices` caches per engine in a process-lifetime dict, and **only on success** — a
 degraded fallback list is never cached, so a later request retries the network.
@@ -781,12 +844,14 @@ App                                   owns activeJobId (mirrored to ?job= via re
 ├── useEngines()   ← owns engine selection, refuses available===false
 ├── useVoices(engineId)                ← refetches per engine
 ├── useThemes()
+├── useLogos()     ← owns logo selection + upload progress
 ├── useJobPolling(activeJobId)         ← 1500 ms setTimeout chain
 ├── useJobHistory()
 ├── useTimeline(activeJobId, status)   ← 2500 ms setTimeout chain
 │
 ├── CreateForm ─ EngineSelector, VoicePicker, ThemePicker ─ PresetCard ─ SlidePreview
 │                                                        └ PaletteEditor ─ ContrastRow
+│              ├ LogoPicker, LogoUploader
 │              └ SlidePreview (live)
 ├── ProgressView ─ StageStepper, SceneInspector ─ SceneCard ─ BulletTrack
 ├── ResultView   ─ ThemeBadge, EngineBadge, SceneSeekList, SceneInspector
@@ -814,6 +879,16 @@ gated by `timelineCouldExist(status)` and written so a populated timeline never 
 `preferredVoiceId(...)`. That is deliberately not an effect, so no render can ever hold a
 Deepgram id under Polly. `useVoices` reinforces it by returning `fallbackVoicesFor(engineId)`
 synchronously during render whenever its cached engine does not match.
+
+**The logo uploader validates before you spend three minutes.** `src/lib/logo.ts` ports the
+renderer's geometry — `LOGO_HEIGHT_FRACTION = 0.045`, `LOGO_MARGIN_FRACTION = 0.028`,
+`LOGO_OPACITY_DARK = 0.85` — with a citation on every constant back to `Theme` in
+`core/models.py` and `logo_height`/`logo_rect` in `text_overlay.py`, so it can tell the user the
+truth about a 49-pixel mark on their chosen palette *before* a render. Its WCAG arithmetic is
+imported from `lib/contrast.ts` and never re-implemented, because that module is the one covered by
+`pnpm run test:contrast`. `useLogos` owns the selection (`BUILT_IN_LOGO_ID` | `"none"` | an id),
+upload progress and errors, and prepends a successful upload to the list rather than refetching —
+a refetch would drop the caller into a loading state immediately after success.
 
 **Client-side WCAG mirrors the backend.** `src/lib/contrast.ts` is dependency-free and is a
 deliberate port: `relativeLuminance`, `contrastRatio`, `evaluatePalette`, `contrastReport` (same
@@ -1008,21 +1083,28 @@ on the ffmpeg module even for a different backend.
 
 ```
 $ uv run pytest tests/ -q -k "not live"
-4 failed, 1830 passed, 27 deselected, 1 warning in 110.31s
+1 failed, 1893 passed, 27 deselected, 1 warning in 107.58s
 ```
 
-All four failures are in `tests/test_render.py`, consistent with `app/render/*` being mid-refactor
-and with an ffmpeg version drift. Concretely:
+The single failure is in `tests/test_render.py`, i.e. in the area that is mid-refactor:
 
 | Test | Cause |
 |---|---|
-| `test_branding_is_duration_neutral_and_survives_every_transition` | The mark **does** pulse: measured lifts `[164.1, 96.2, 176.5, 188.6, 181.9]`, spread 92.4 against a tolerance of `0.35 × max = 66`. Duration-neutrality passes; constancy does not |
-| `test_a_clip_stretched_over_full_bleed_is_flagged_as_an_upscale` | Test expects **no** warning for `hero_right`, but the 4:5 region is now 720×900, so a 1280×720 clip is a 1.25× upscale and the (correct) warning fires. The test predates the region change |
-| `test_render_all_accepts_a_scene_whose_visual_is_a_clip` | `OSError: Read-only file system: '/nonexistent-dir-for-validation'` — `render_all` does `clip_dir.mkdir(...)` *before* its validation loop, so the test's "validate before touching disk" assumption no longer holds |
-| `test_a_looped_clip_never_freezes_and_never_repeats_a_frame_at_the_seam` | Test harness bug: it passes `fps_mode=passthrough` inside `-vf`, which is an output option, not a filter. This ffmpeg (Lavf62) rejects it: *"No option name near 'passthrough'"* |
+| `test_branding_is_duration_neutral_and_survives_every_transition` | The mark **does** pulse. Measured lifts across the video `[164.1, 96.2, 176.5, 188.6, 181.9]` — spread 92.4 against a tolerance of `0.35 × max = 66`. Duration-neutrality and presence both pass; *constancy* does not |
 
-Two of these are stale test assumptions, one is a harness bug, and one — the pulsing watermark —
-looks like a real regression in output.
+This looks like a real regression in output rather than a stale assertion, and it is worth noting
+that the scene it dips on is a `slideleft` boundary — which the assemble-time compositing in §8.4
+is specifically supposed to make impossible.
+
+Two caveats on this number. `app/render/*` moved **during the writing of this document**: an
+earlier run in the same session reported `4 failed, 1830 passed`, and three of those four
+(a stale `hero_right` upscale-warning expectation, a `clip_dir.mkdir` ordering assumption, and a
+harness bug passing `fps_mode=passthrough` inside `-vf`) were fixed upstream while this was being
+written. Re-run the suite rather than trusting this line. Also note that
+`ffmpeg_backend.upscale_factors` was replaced by `motion_canvas`/`MotionCanvas`/`plan_zoom_ceiling`
+mid-session, and a whole logo-upload feature (`app/api/logos.py`, `Job.logo_id`,
+`Timeline.logo_path`, `frontend/src/lib/logo.ts`) landed — §8.4/§8.6/§9/§10 describe the state
+*after* those changes.
 
 ### Known gaps, specifically
 
@@ -1057,13 +1139,22 @@ looks like a real regression in output.
 5. **`Language` is not plumbed at all.** `Timeline.language` exists and defaults to `EN`, and
    `gemini_script` supports it *thoroughly* — `_language_block`, `_anchor_note`, per-language
    stopwords, the danda `।` as a sentence terminator, capitalisation skipped for non-Latin scripts,
-   and word budgets scaled by `LANGUAGE_WORD_FACTOR` (derived from `MEASURED_WPM` en 114.3 /
-   es 161.5 / hi 183.7 → factors **1.0 / 1.41 / 1.61**). None of it is reachable: there is no
-   `language` column on `Job`, no field on `JobCreate`, `pipeline._script_kwargs` only ever
-   forwards `bullets_per_slide` and `tone`, and `_stage_script` builds the `Timeline` without
-   `language=`. Today every job is English end to end. (One stale comment to ignore:
-   `gemini_script.py:197-199` says "1.14x and 1.32x", which no longer matches the computed
-   factors.)
+   and per-language word budgets. None of it is reachable: there is no `language` column on `Job`,
+   no field on `JobCreate`, `pipeline._script_kwargs` only ever forwards `bullets_per_slide` and
+   `tone`, and `_stage_script` builds the `Timeline` without `language=`. Today every job is
+   English end to end.
+
+   Worth knowing before you touch the pacing numbers: `LANGUAGE_WPM` is en 135 / es 140 / hi 155
+   and `LANGUAGE_WORD_FACTOR` is 1.0 / 1.04 / 1.15, with `docs/LANGUAGES.md` §6.2 as the stated
+   authority, and `ROLE_NARRATION_WORDS_BY_LANGUAGE` is **transcribed** from that document rather
+   than recomputed — because multiplying and rounding does not reproduce it exactly (43 × 1.15 =
+   49.45 → 49, where the doc says 50). An earlier pass at this file measured en 114 / hi 184 wpm
+   and derived factors of 1.41/1.61; those were discarded as really measuring *sentence length*,
+   since each language's sample had a different sentence count. LANGUAGES.md §6.3 records that
+   words-per-second ranged 2.40–3.80 across experiments — a 58% spread driven almost entirely by
+   how many sentence-final pauses the model wrote, not by the language. The consequence is stated
+   plainly in the source: a Spanish slide carries ~93% and a Hindi slide ~90% of the English
+   slide's information, which is a real teaching-content loss.
 6. **`bullets_per_slide=5` is silently capped to 4.** `JobCreate` accepts `ge=3, le=5`, but
    `SceneRole.CONTENT.bullet_budget` is 4 and the budget is enforced three times —
    `pipeline._within_bullet_budget` at scripting, `RuleBasedPlanner.plan` when

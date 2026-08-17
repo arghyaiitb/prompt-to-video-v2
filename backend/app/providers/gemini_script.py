@@ -127,11 +127,61 @@ class StructuredSceneScript(SceneScript):
     clip_prompt: str | None = None
     """Motion description for a video model. See `Scene.clip_prompt`."""
 
+    ssml: str | None = None
+    """Marked-up narration for SSML-capable engines. See `Scene.ssml`.
+
+    Built programmatically from `narration` rather than authored by the model: the
+    round-trip invariant (stripping the markup must return the words unchanged) is only
+    enforceable on a pure function, and an LLM that silently rewrote a word would corrupt
+    every bullet anchor with no way to repair it.
+    """
+
 
 def scene_role(scene: SceneScript) -> SceneRole:
     """The scene's role, defaulting to CONTENT for a plain `SceneScript`."""
     role = getattr(scene, "role", None)
     return role if isinstance(role, SceneRole) else SceneRole.CONTENT
+
+
+def scene_ssml(scene: SceneScript) -> str | None:
+    """The scene's SSML, or None for a provider that doesn't build any."""
+    return getattr(scene, "ssml", None)
+
+
+def _attach_ssml(scenes: list[StructuredSceneScript]) -> None:
+    """Populate `.ssml` on each scene. Best-effort, in place.
+
+    Built from the FINAL bullets, because the markup stresses the phrase each bullet
+    anchors to — so the spoken emphasis and the on-screen reveal land on the same words.
+
+    Failure is never fatal: SSML is an enhancement, and every consumer falls back to
+    `narration`. `build_ssml` raises `SsmlInvariantError` if stripping the markup would not
+    return the words unchanged — that guard exists because altered words would corrupt
+    every bullet anchor, so a scene that trips it is left with no SSML rather than
+    silently shipping drifted timings.
+    """
+    try:
+        from app.providers.ssml import build_ssml
+    except ImportError:  # pragma: no cover - ssml module is optional
+        logger.debug("app.providers.ssml unavailable; narration stays plain text")
+        return
+
+    engine = f"polly-{get_settings().video_polly_engine}"
+    for scene in scenes:
+        try:
+            scene.ssml = build_ssml(
+                scene.narration,
+                role=scene_role(scene),
+                bullets=tuple(scene.bullets),
+                engine=engine,
+            )
+        except Exception:  # noqa: BLE001 - plain narration is always a valid fallback
+            logger.warning(
+                "SSML build failed for scene %s; narration stays plain text",
+                scene.id,
+                exc_info=True,
+            )
+            scene.ssml = None
 
 
 def scene_clip_prompt(scene: SceneScript) -> str | None:
@@ -624,6 +674,9 @@ class GeminiScriptProvider:
         scenes = _renumber(scenes)
         scenes = _vary_motion(scenes)
         scenes = _apply_roles(scenes, bullet_count, language)
+        # Last: SSML stresses the phrases each bullet anchors to, so the bullets must
+        # already be final. Best-effort — see _attach_ssml.
+        _attach_ssml(scenes)
 
         title = _clean_heading(str(payload.get("title") or topic), language) or topic.strip()
         return Script(topic=topic.strip(), title=title, scenes=scenes)
@@ -709,6 +762,9 @@ class VerbatimScriptProvider:
         title = (
             self.title or _heading_from(self.script_text, fallback=topic, language=language)
         ).strip()
+        # Same treatment as the LLM path: the words are the user's, but the pauses and
+        # stress are ours to add, and both providers feed the same synthesizer.
+        _attach_ssml(scenes)
         return Script(topic=topic.strip(), title=title or topic.strip(), scenes=scenes)
 
 

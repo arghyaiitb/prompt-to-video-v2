@@ -9,7 +9,15 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
-from app.core.models import BulletPoint, RenderProfile, Script, Timeline, VisualPlan, Word
+from app.core.models import (
+    BulletPoint,
+    Language,
+    RenderProfile,
+    Script,
+    Timeline,
+    VisualPlan,
+    Word,
+)
 
 if TYPE_CHECKING:
     # Render-time artifact; imported lazily so core stays independent of app.render.
@@ -27,6 +35,7 @@ class ScriptProvider(Protocol):
         *,
         bullets_per_slide: int = 4,
         tone: str | None = None,
+        language: Language = Language.EN,
     ) -> Script:
         """Write `slide_count` scenes about `topic`.
 

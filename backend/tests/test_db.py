@@ -190,12 +190,54 @@ def test_migrate_adds_every_new_column(tmp_path: Path) -> None:
 
     engine = make_engine(db_path)
     added = db_models.migrate(engine)
-    assert added == ["theme", "theme_custom", "bullets_per_slide", "tone", "tts_engine"]
+    expected = ["theme", "theme_custom", "bullets_per_slide", "tone", "tts_engine", "logo_id"]
+    assert added == expected
 
     with engine.connect() as conn:
         columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info('job')").fetchall()}
-    assert {"theme", "theme_custom", "bullets_per_slide", "tone", "tts_engine"} <= columns
+    assert set(expected) <= columns
     engine.dispose()
+
+
+def test_logo_id_survives_the_migration_of_an_old_database(tmp_path: Path) -> None:
+    """`backend/videos.db` is a live database with real rows in it.
+
+    `create_all` never alters an existing table, so without the `logo_id` entry in
+    `_ADDED_COLUMNS` the first POST /api/jobs carrying a logo dies with "table job has no
+    column named logo_id" inside the handler. The pre-existing rows must also come back
+    with NULL — which is the state that means "the bundled default mark", i.e. exactly the
+    branding those videos already have.
+    """
+    db_path = tmp_path / "legacy-logo.db"
+    with sqlite3.connect(db_path) as raw:
+        raw.execute(_OLD_SCHEMA)
+        raw.execute(
+            "INSERT INTO job (id, topic, slide_count, voice, music, status, progress, "
+            "created_at, updated_at) VALUES "
+            "('legacy-logo', 'Old job', 3, 'v', 0, 'done', 100, "
+            "'2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+        )
+
+    set_engine(make_engine(db_path))
+    try:
+        init_db()
+        with session_scope() as session:
+            job = Job(topic="Branded", slide_count=2, voice="v", logo_id="a" * 32)
+            session.add(job)
+            session.commit()
+            job_id = job.id
+
+        with session_scope() as session:
+            stored = session.get(Job, job_id)
+            assert stored is not None
+            assert stored.logo_id == "a" * 32
+
+            legacy = session.get(Job, "legacy-logo")
+            assert legacy is not None
+            assert legacy.logo_id is None
+            assert pipeline.resolve_job_logo(legacy) is None
+    finally:
+        set_engine(None)
 
 
 def test_tts_engine_survives_the_migration_of_an_old_database(tmp_path: Path) -> None:

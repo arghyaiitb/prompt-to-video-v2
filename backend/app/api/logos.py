@@ -653,7 +653,13 @@ def _claims_png(upload: UploadFile) -> bool:
 
 
 def _detect_format(path: Path, upload: UploadFile) -> LogoFormat:
-    """PNG or SVG, from the content. Anything else is a 415."""
+    """PNG or SVG, from the content. Anything else is a 415.
+
+    The SVG arm requires the document to *start* with markup, which is what separates
+    "this is XML we should vet" from "this is a JPEG/WebP/text file": both would otherwise
+    fall through to the XML parser and be reported as malformed SVG, which tells the caller
+    nothing useful about a file they never claimed was an SVG.
+    """
     with path.open("rb") as fh:
         prefix = fh.read(len(PNG_MAGIC))
     if prefix == PNG_MAGIC:
@@ -664,6 +670,12 @@ def _detect_format(path: Path, upload: UploadFile) -> LogoFormat:
             "png_magic_mismatch",
             "the upload is declared as PNG but does not start with the PNG signature; "
             "the file content is what decides, and it is not a PNG",
+        )
+    if not prefix.lstrip(b"\xef\xbb\xbf \t\r\n").startswith(b"<"):
+        _reject(
+            415,
+            "unsupported_logo_format",
+            "only PNG and SVG are accepted; this file is neither a PNG nor an XML document",
         )
     return "svg"
 
@@ -716,6 +728,8 @@ async def upload_logo(file: Annotated[UploadFile, File()]) -> LogoOut:
 
         stored_source = source_path(logo_id, fmt)
         os.replace(temp_path, stored_source)
+        # mkstemp creates 0600; the store is served like any other cache artifact.
+        stored_source.chmod(0o644)
     finally:
         temp_path.unlink(missing_ok=True)
 

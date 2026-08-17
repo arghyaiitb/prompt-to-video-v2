@@ -8,11 +8,13 @@ import {
   MusicIcon,
   PaletteIcon,
   SparklesIcon,
+  StampIcon,
   UsersIcon,
   WandSparklesIcon,
 } from 'lucide-react'
 
 import { EngineSelector } from '@/components/EngineSelector'
+import { LogoPicker } from '@/components/LogoPicker'
 import { SlidePreview } from '@/components/SlidePreview'
 import { ThemePicker } from '@/components/ThemePicker'
 import { Button } from '@/components/ui/button'
@@ -28,9 +30,17 @@ import { Slider } from '@/components/ui/slider'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { VoicePicker } from '@/components/VoicePicker'
+import { logoIdForRequest } from '@/hooks/useLogos'
 import { FALLBACK_THEMES, preferredVoiceId } from '@/lib/api'
 import { evaluatePalette, formatRatio, type Palette } from '@/lib/contrast'
 import {
+  BUILT_IN_LOGO_URL,
+  logoOpacityFor,
+  LOGO_HEIGHT_FRACTION,
+  LOGO_RENDER_HEIGHT,
+} from '@/lib/logo'
+import {
+  BUILT_IN_LOGO_ID,
   CUSTOM_THEME_ID,
   DEFAULT_BULLETS,
   DEFAULT_THEME_ID,
@@ -38,7 +48,10 @@ import {
   MAX_BULLETS,
   MIN_BULLETS,
   TONE_OPTIONS,
+  type BrandLogo,
   type CreateJobRequest,
+  type LogoRejection,
+  type LogoSelection,
   type SpeechEngine,
   type ThemeContrastFailure,
   type ThemePreset,
@@ -92,6 +105,20 @@ interface CreateFormProps {
   /** A palette the server has rejected — cleared when the palette changes. */
   contrastFailure: ThemeContrastFailure | null
   onDismissContrastFailure: () => void
+  /* Brand logo — owned by `useLogos` above, because the upload and the
+     catalogue outlive any one render of this form. */
+  logos: BrandLogo[]
+  logosLoading: boolean
+  logosAvailable: boolean
+  logoNoneValue: string
+  logoSelection: LogoSelection
+  onSelectLogo: (selection: LogoSelection) => void
+  onRemoveLogo: (logoId: string) => void
+  logoUploadProgress: number | null
+  logoUploadError: string | null
+  onUploadLogo: (file: File) => Promise<unknown>
+  /** A `logo_id` the server refused. Never retried around — see `createJob`. */
+  logoRejection: LogoRejection | null
   isSubmitting: boolean
   onSubmit: (request: CreateJobRequest) => void
 }
@@ -111,6 +138,17 @@ export function CreateForm({
   usedFallbackThemes,
   contrastFailure,
   onDismissContrastFailure,
+  logos,
+  logosLoading,
+  logosAvailable,
+  logoNoneValue,
+  logoSelection,
+  onSelectLogo,
+  onRemoveLogo,
+  logoUploadProgress,
+  logoUploadError,
+  onUploadLogo,
+  logoRejection,
   isSubmitting,
   onSubmit,
 }: CreateFormProps) {
@@ -168,6 +206,34 @@ export function CreateForm({
     : (selectedPreset?.swatches ?? SEED_PALETTE)
 
   const report = useMemo(() => evaluatePalette(activePalette), [activePalette])
+
+  /*
+   * The opacity the mark composites at, for whatever palette is active.
+   *
+   * `Theme.logo_opacity` is 0.85 by default and 0.92 on every light preset, and
+   * the catalogue does not serialise it, so it is derived from the polarity —
+   * from the *live* polarity for a custom palette, which is how the renderer
+   * would resolve it too. It matters because the number the contrast note shows
+   * is measured on the composite, not on the raw brand colour.
+   */
+  const logoOpacity = isCustomTheme
+    ? logoOpacityFor({ is_light: report.isLight })
+    : logoOpacityFor(selectedPreset)
+
+  const activeThemeName = isCustomTheme ? 'your custom palette' : (selectedPreset?.name ?? 'the theme')
+
+  /**
+   * The mark to draw in the theme preview.
+   *
+   * Kept in step with the picker so the two frames never disagree — the theme
+   * preview claims to show the slide, and a slide has the watermark on it.
+   */
+  const previewLogoSrc: string | null =
+    logoSelection === BUILT_IN_LOGO_ID
+      ? BUILT_IN_LOGO_URL
+      : logoSelection === logoNoneValue
+        ? null
+        : (logos.find((logo) => logo.id === logoSelection)?.url ?? null)
 
   /**
    * Only a custom palette can block submission, and only below WCAG AA — the
@@ -227,6 +293,11 @@ export function CreateForm({
     // Sent only in custom mode: `ThemeCustom` forbids extra keys and requires
     // all five colours, so it is all or nothing.
     if (isCustomTheme) request.theme_custom = customPalette
+
+    // `undefined` for the built-in mark: the field is omitted, which is exactly
+    // how the backend is told to use its configured default.
+    const logoId = logoIdForRequest(logoSelection)
+    if (logoId !== undefined) request.logo_id = logoId
 
     onSubmit(request)
   }
@@ -402,8 +473,18 @@ export function CreateForm({
         {/* Live preview of whatever is selected. Slides are a solid ground,
             so the palette is the design — it has to be seen as a frame. */}
         <figure className="space-y-2">
-          <div className="overflow-hidden rounded-xl border border-white/10 shadow-2xl shadow-black/40">
-            <SlidePreview palette={activePalette} />
+          <div
+            data-testid="theme-frame-preview"
+            className="overflow-hidden rounded-xl border border-white/10 shadow-2xl shadow-black/40"
+          >
+            {/* The brand mark is part of the frame, so it is drawn here too —
+                bottom-left, at the renderer's scale and opacity. */}
+            <SlidePreview
+              palette={activePalette}
+              logo={
+                previewLogoSrc === null ? null : { src: previewLogoSrc, opacity: logoOpacity }
+              }
+            />
           </div>
           <figcaption className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-white/30">
             <span>Preview of a hero-right slide.</span>
@@ -427,6 +508,48 @@ export function CreateForm({
           onSelectCustom={handleSelectCustom}
           onChangeCustom={handleChangeCustom}
           contrastFailure={contrastFailure}
+        />
+      </div>
+
+      {/* Brand logo ---------------------------------------------------- */}
+      <div className="space-y-4">
+        <div className="flex items-baseline justify-between gap-3">
+          <Label className="flex items-center gap-2 text-sm font-medium text-white/80">
+            <StampIcon className="size-3.5 text-violet-300/70" />
+            Brand logo
+          </Label>
+          <span className="text-xs text-white/30">
+            {logoSelection === BUILT_IN_LOGO_ID
+              ? 'Built-in mark'
+              : logoSelection === logoNoneValue
+                ? 'None'
+                : (logos.find((logo) => logo.id === logoSelection)?.original_filename ??
+                  'Uploaded')}
+          </span>
+        </div>
+
+        <p className="text-xs leading-relaxed text-white/35">
+          Composited bottom-left for the whole video, at{' '}
+          {(LOGO_HEIGHT_FRACTION * 100).toFixed(1)}% of frame height —{' '}
+          <span className="font-medium text-white/50">{LOGO_RENDER_HEIGHT}px at 1080p</span>. At
+          that size a wordmark is unreadable, so a symbol works better than a full lockup.
+        </p>
+
+        <LogoPicker
+          logos={logos}
+          isLoading={logosLoading}
+          available={logosAvailable}
+          noneValue={logoNoneValue}
+          selection={logoSelection}
+          onSelect={onSelectLogo}
+          onRemove={onRemoveLogo}
+          progress={logoUploadProgress}
+          uploadError={logoUploadError}
+          onUpload={onUploadLogo}
+          palette={activePalette}
+          themeName={activeThemeName}
+          opacity={logoOpacity}
+          rejection={logoRejection}
         />
       </div>
 
