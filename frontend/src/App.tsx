@@ -193,10 +193,14 @@ export default function App() {
       setLogoRejection(null)
       const logo = await logoState.upload(file)
       if (logo !== null) {
+        // The server's own caveats win over the generic line: an SVG whose
+        // `<filter>` was dropped is the thing worth reading, and the preview
+        // already shows the rasterised result rather than the original.
         toast.success('Logo uploaded', {
           description:
-            logo.warning ??
-            `It will be composited bottom-left at 49px. Check the preview before you generate.`,
+            logo.warnings.length > 0
+              ? logo.warnings.join(' ')
+              : 'It will be composited bottom-left at 49px. Check the preview before you generate.',
         })
       }
       return logo

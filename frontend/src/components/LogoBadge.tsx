@@ -50,11 +50,11 @@ function resolve(job: Job, logos: BrandLogo[], noneValue: string): Resolved | nu
   const match = logos.find((logo) => logo.id === id) ?? null
   // An id with no catalogue entry still gets a badge — it is what the server says
   // was used, and the logo may simply have been deleted since.
-  const label = match?.original_filename ?? `Logo ${id.slice(0, 8)}`
+  const label = match?.filename ?? `Logo ${id.slice(0, 8)}`
   return {
     label,
     title: `Branded with ${label}`,
-    thumbnail: match?.url ?? `/api/logos/${encodeURIComponent(id)}`,
+    thumbnail: match?.renderUrl ?? `/api/logos/${encodeURIComponent(id)}/render`,
     none: false,
   }
 }

@@ -100,6 +100,13 @@ class Job(SQLModel, table=True):
     """
 
     logo_id: str | None = None
+
+    reuse_from: str | None = None
+    """Reuse another job's script and imagery instead of generating new ones.
+
+    Makes an honest A/B possible: change only the voice, engine or theme and everything
+    else — words, bullets, pictures — is byte-identical to the source render.
+    """
     """Uploaded brand mark for this video — an id from POST /api/logos.
 
     Three states, all meaningful: NULL is "the bundled default mark" (which is what every
@@ -184,6 +191,8 @@ _ADDED_COLUMNS: tuple[tuple[str, str], ...] = (
     # Nullable with no default on purpose: NULL is the meaningful "bundled default mark"
     # state, so every pre-existing row keeps rendering exactly the branding it had.
     ("logo_id", "VARCHAR"),
+    # Job id whose script and imagery this render reuses. NULL = generate fresh.
+    ("reuse_from", "VARCHAR"),
 )
 
 

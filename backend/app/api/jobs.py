@@ -81,6 +81,14 @@ class JobCreate(BaseModel):
 
     tone: Tone | None = None
 
+    reuse_from: str | None = Field(default=None, max_length=64)
+    """Reuse another job's script and imagery, changing only what you pass here.
+
+    The point is an honest comparison: render the same words and pictures with a different
+    voice, engine or theme. Costs no LLM or image credits, and the two videos differ only
+    in what you actually changed. `topic` and `slide_count` are ignored when set.
+    """
+
     logo_id: str | None = Field(default=None, max_length=64)
     """Brand mark for this video — an id from POST /api/logos.
 
@@ -360,6 +368,7 @@ async def create_job(payload: JobCreate, session: SessionDep) -> JobCreated:
             if payload.theme_custom is not None
             else None
         ),
+        reuse_from=(payload.reuse_from or "").strip() or None,
         bullets_per_slide=payload.bullets_per_slide,
         tone=payload.tone,
         logo_id=_resolve_logo_id(payload.logo_id),

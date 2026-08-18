@@ -288,6 +288,11 @@ def speech_synthesizer(
         cls,
         f"tts:{spec.id}",
         api_key=settings.deepgram_api_key if spec.id == "deepgram" else None,
+        # Deepgram only: 48 kHz is real bandwidth there (see the setting's docstring).
+        # Polly's PCM path maxes at 16 kHz, so it gets None and keeps its own default.
+        sample_rate=(
+            settings.video_deepgram_sample_rate if spec.id == "deepgram" else None
+        ),
         voice=default_voice(spec.id, settings),
         default_voice=default_voice(spec.id, settings),
         region=settings.aws_region,

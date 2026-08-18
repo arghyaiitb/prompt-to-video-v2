@@ -1345,8 +1345,12 @@ class TestDeepgramSynthesizer:
         assert captured["params"] == {
             "model": "aura-2-draco-en",
             "encoding": "linear16",
-            "sample_rate": "24000",
+            # 48 kHz, not 24: at 24 kHz the band above 12 kHz is empty (12 kHz IS the
+            # Nyquist limit); at 48 kHz it carries real sibilance and breath. Speed 0.9
+            # lands ~146 wpm against the pipeline's 135 target — 1.0 overshoots by ~22%.
+            "sample_rate": "48000",
             "container": "wav",
+            "speed": "0.9",
         }
         assert captured["headers"]["Authorization"] == "Token k"
         assert captured["headers"]["Content-Type"] == "application/json"

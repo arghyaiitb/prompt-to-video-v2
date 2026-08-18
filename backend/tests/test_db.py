@@ -190,7 +190,15 @@ def test_migrate_adds_every_new_column(tmp_path: Path) -> None:
 
     engine = make_engine(db_path)
     added = db_models.migrate(engine)
-    expected = ["theme", "theme_custom", "bullets_per_slide", "tone", "tts_engine", "logo_id"]
+    expected = [
+        "theme",
+        "theme_custom",
+        "bullets_per_slide",
+        "tone",
+        "tts_engine",
+        "logo_id",
+        "reuse_from",
+    ]
     assert added == expected
 
     with engine.connect() as conn:

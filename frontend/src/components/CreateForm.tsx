@@ -38,6 +38,7 @@ import {
   logoOpacityFor,
   LOGO_HEIGHT_FRACTION,
   LOGO_RENDER_HEIGHT,
+  type LogoInspection,
 } from '@/lib/logo'
 import {
   BUILT_IN_LOGO_ID,
@@ -170,6 +171,16 @@ export function CreateForm({
    */
   const [voiceChoice, setVoiceChoice] = useState<{ engine: string; id: string } | null>(null)
 
+  /**
+   * A logo that has been inspected locally but not uploaded.
+   *
+   * Held here, above both previews, so the framed slide and the logo section
+   * never disagree about which mark is on the frame. It does not change the
+   * *selection*: `logo_id` is still whatever the picker says until an upload
+   * succeeds, which is why the caption badges it as "not uploaded yet".
+   */
+  const [pendingLogo, setPendingLogo] = useState<LogoInspection | null>(null)
+
   const selectedEngine = engines.find((engine) => engine.id === engineId) ?? null
 
   const voice = useMemo(() => {
@@ -229,11 +240,12 @@ export function CreateForm({
    * preview claims to show the slide, and a slide has the watermark on it.
    */
   const previewLogoSrc: string | null =
-    logoSelection === BUILT_IN_LOGO_ID
+    pendingLogo?.objectUrl ??
+    (logoSelection === BUILT_IN_LOGO_ID
       ? BUILT_IN_LOGO_URL
       : logoSelection === logoNoneValue
         ? null
-        : (logos.find((logo) => logo.id === logoSelection)?.url ?? null)
+        : (logos.find((logo) => logo.id === logoSelection)?.renderUrl ?? null))
 
   /**
    * Only a custom palette can block submission, and only below WCAG AA — the
@@ -523,7 +535,7 @@ export function CreateForm({
               ? 'Built-in mark'
               : logoSelection === logoNoneValue
                 ? 'None'
-                : (logos.find((logo) => logo.id === logoSelection)?.original_filename ??
+                : (logos.find((logo) => logo.id === logoSelection)?.filename ??
                   'Uploaded')}
           </span>
         </div>
@@ -550,6 +562,8 @@ export function CreateForm({
           themeName={activeThemeName}
           opacity={logoOpacity}
           rejection={logoRejection}
+          pending={pendingLogo}
+          onPendingChange={setPendingLogo}
         />
       </div>
 

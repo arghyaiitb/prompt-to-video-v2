@@ -101,7 +101,7 @@ export function LogoPicker({
    * are sent, not after.
    */
   const previewSrc: string | null = pending?.objectUrl ?? (
-    isNone ? null : isBuiltIn ? BUILT_IN_LOGO_URL : (selectedLogo?.url ?? null)
+    isNone ? null : isBuiltIn ? BUILT_IN_LOGO_URL : (selectedLogo?.renderUrl ?? null)
   )
 
   const previewLogo: PreviewLogo | null = previewSrc === null ? null : { src: previewSrc, opacity }
@@ -152,7 +152,7 @@ export function LogoPicker({
       ? 'No brand mark'
       : isBuiltIn
         ? 'Built-in mark'
-        : (selectedLogo?.original_filename ?? selectedLogo?.id ?? '—')
+        : (selectedLogo?.filename ?? selectedLogo?.id ?? '—')
 
   return (
     <div className={cn('space-y-4', className)}>
@@ -281,7 +281,7 @@ export function LogoPicker({
       ) : (
         <div className="grid gap-2 sm:grid-cols-2" data-testid="logo-options">
           <OptionCard
-            isSelected={isBuiltIn && pending === null}
+            isSelected={isBuiltIn}
             onSelect={() => {
               onSelect(BUILT_IN_LOGO_ID)
             }}
@@ -295,7 +295,7 @@ export function LogoPicker({
           />
 
           <OptionCard
-            isSelected={isNone && pending === null}
+            isSelected={isNone}
             onSelect={() => {
               onSelect(noneValue)
             }}
@@ -309,25 +309,25 @@ export function LogoPicker({
           {logos.map((logo) => (
             <OptionCard
               key={logo.id}
-              isSelected={selection === logo.id && pending === null}
+              isSelected={selection === logo.id}
               onSelect={() => {
                 onSelect(logo.id)
               }}
               testId="logo-option-uploaded"
-              title={logo.original_filename ?? logo.id}
+              title={logo.filename ?? logo.id}
               hint={[
                 logo.width !== null && logo.height !== null
                   ? `${String(logo.width)}x${String(logo.height)}`
                   : null,
                 logo.format,
-                logo.bytes !== null ? formatBytes(logo.bytes) : null,
+                logo.size_bytes !== null ? formatBytes(logo.size_bytes) : null,
                 logo.has_alpha === false ? 'no transparency' : null,
               ]
                 .filter((part): part is string => part !== null && part !== '')
                 .join(' · ')}
-              warning={logo.warning}
+              warnings={logo.warnings}
               thumbnail={
-                <img src={logo.url} alt="" className="max-h-full max-w-full object-contain" />
+                <img src={logo.renderUrl} alt="" className="max-h-full max-w-full object-contain" />
               }
               palette={palette}
               onRemove={() => {
@@ -361,8 +361,8 @@ interface OptionCardProps {
   onSelect: () => void
   title: string
   hint: string
-  /** The server's caveat about this specific file, if it sent one. */
-  warning?: string | null
+  /** The server's caveats about this specific file — `warnings` from the upload. */
+  warnings?: string[]
   thumbnail: ReactNode
   palette: Palette
   onRemove?: () => void
@@ -374,7 +374,7 @@ function OptionCard({
   onSelect,
   title,
   hint,
-  warning = null,
+  warnings = [],
   thumbnail,
   palette,
   onRemove,
@@ -413,12 +413,19 @@ function OptionCard({
           {hint !== '' && (
             <span className="mt-0.5 block truncate text-[11px] text-white/35">{hint}</span>
           )}
-          {warning !== null && (
-            <span className="mt-1 flex items-start gap-1 text-[11px] leading-snug text-amber-300/80">
+          {/* One line per caveat. These come from the server's own rasteriser,
+              so they are the authoritative version of what the browser's
+              pre-flight SVG scan can only guess at. */}
+          {warnings.map((warning) => (
+            <span
+              key={warning}
+              data-testid="logo-server-warning"
+              className="mt-1 flex items-start gap-1 text-[11px] leading-snug text-amber-300/80"
+            >
               <InfoIcon className="mt-px size-3 shrink-0" />
               {warning}
             </span>
-          )}
+          ))}
         </span>
       </button>
 

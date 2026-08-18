@@ -99,6 +99,37 @@ class Settings(BaseSettings):
     eat half the pause.
     """
 
+    video_deepgram_sample_rate: int = 48_000
+    """Narration sample rate requested from Deepgram Aura.
+
+    48000, not the old 24000. Measured: at 24 kHz the band above 12 kHz is empty (-91 dB,
+    since 12 kHz IS the Nyquist limit); at 48 kHz it carries real content (-44 to -48 dB)
+    — sibilance, breath, air. Full-band level is unchanged, so this is bandwidth rather
+    than loudness. The final mux is AAC at 48 kHz, so requesting 24 kHz meant
+    downsampling at synthesis and upsampling again at assembly.
+
+    Deepgram-only. Polly's PCM path caps at 16 kHz and 24000 there forces an mp3
+    transcode, so this value is never handed to Polly.
+    """
+
+    video_deepgram_speed: float = 0.9
+    """Deepgram `speed` for narration. 0.9, not 1.0.
+
+    Measured over 3 repeats on a 37-word sentence: speed 1.0 delivers ~165 wpm, which
+    overshoots this pipeline's 135 wpm pacing target by ~22%; 0.9 lands at ~146 wpm
+    (~8% over) and is also Deepgram's own documented recommendation for training content.
+    Valid range 0.7-1.5 (floor 0.9 for `*-es` voices).
+    """
+
+    video_render_concurrency: int = 0
+    """Scenes rendered at once per job. 0 = auto (`min(4, cpu//3)`).
+
+    Lower this when several JOBS render concurrently: the parallelism is per-job, so three
+    jobs at the auto setting request 3 x 4 workers x 3 encoder threads = 36 threads on a
+    12-core box and thrash. Total useful threads is a property of the machine, not of the
+    job count.
+    """
+
     video_api_concurrency: int = 4
     """Concurrent calls per provider during the fan-out stages (images, TTS, alignment).
 

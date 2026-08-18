@@ -1837,10 +1837,27 @@ def test_assembled_duration_matches_final_duration(assets, tmp_path):
 def test_branding_is_duration_neutral_and_survives_every_transition(assets, tmp_path):
     """The two things the watermark must not do: shift timing, or pulse at a boundary.
 
-    The transition here is ``slideleft`` on purpose. A logo burnt into each scene clip
-    literally slides off the left edge with the outgoing frame, so a wipe or a slide is a
-    far harsher test than a crossfade — and it is what the planner's rotation actually
-    picks for the second boundary.
+    The transition here is ``slideleft`` on purpose, and it is *harsher than anything the
+    planner now emits* — ``TRANSITION_ROTATION`` is ``(FADE,)``, so a slide never actually
+    ships. It is kept because a logo burnt into each scene clip would literally slide off the
+    left edge with the outgoing frame, which a crossfade would hide. (An earlier version of
+    this docstring claimed a slide was what the rotation picked for the second boundary. That
+    was true once and is not any more.)
+
+    Constancy is asserted on the mark's **absolute** value, not on its lift over a control
+    patch elsewhere in the frame. The differential version of this measurement was wrong, and
+    wrong in a way that accused a working watermark: the control patch sits along the bottom
+    edge three logo-widths to the right, so mid-``slideleft`` the *incoming picture* slides
+    through it. Measured on this exact scenario, at the first boundary's midpoint the control
+    patch jumped from ~31 to ~87 while the mark itself only moved 195 -> 183, so the
+    differential collapsed by half and reported a pulse that was not there. Absolute spread
+    over the same five samples is 17.6% (steady); under ``FADE``, where the control patch
+    holds still, both readings agree at ~1-2%.
+
+    The mark's absolute value is still allowed to vary a little, because ``logo_opacity`` is
+    0.85 and the picture behind it genuinely changes at a boundary. Hence a tolerance rather
+    than an equality -- but the tolerance is on the thing that actually means "the mark
+    dimmed", so it is a real guard.
     """
     scenes = [
         Scene(
@@ -1896,14 +1913,14 @@ def test_branding_is_duration_neutral_and_survives_every_transition(assets, tmp_
         half = scenes[index].plan.transition_duration / 2
         stamps += [boundary + half, starts[index] + durations[index] / 2]
 
-    def logo_lift(video: Path, when: float) -> float:
-        """Blue lift of the mark's core over a logo-free control patch of the same frame.
+    share = float(subprocess.run(  # noqa: S603
+        [binary, str(mask), "-format", "%[fx:mean]", "info:"],
+        capture_output=True, text=True, check=True).stdout)
 
-        The picture behind the logo changes at every boundary, so an absolute reading
-        cannot tell "the logo faded" from "the scene changed". A difference can.
-        """
+    def logo_core(video: Path, when: float) -> float:
+        """Mean blue of the mark's own opaque core, 0-255. Absolute, not differential."""
         frame = tmp_path / f"f{video.stem}{when:.3f}.png"
-        ff.ffmpeg(["-ss", f"{when:.4f}", "-i", video, "-frames:v", "1", frame])
+        ff.ffmpeg(["-ss", f"{when:.4f}", "-i", video, "-frames:v", "1", "-update", "1", frame])
         crop = tmp_path / "crop.png"
         subprocess.run(  # noqa: S603
             [binary, str(frame), "-crop",
@@ -1918,22 +1935,17 @@ def test_branding_is_duration_neutral_and_survives_every_transition(assets, tmp_
         core_b = float(subprocess.run(  # noqa: S603
             [binary, str(masked), "-format", "%[fx:mean.b]", "info:"],
             capture_output=True, text=True, check=True).stdout)
-        share = float(subprocess.run(  # noqa: S603
-            [binary, str(mask), "-format", "%[fx:mean]", "info:"],
-            capture_output=True, text=True, check=True).stdout)
-        control_b = float(subprocess.run(  # noqa: S603
-            [binary, str(frame), "-crop",
-             f"{region.width}x{region.height}+{region.x + 3 * region.width}+{region.y}",
-             "+repage", "-format", "%[fx:mean.b]", "info:"],
-            capture_output=True, text=True, check=True).stdout)
-        return 255 * (core_b / max(share, 1e-6) - control_b)
+        return 255 * core_b / max(share, 1e-6)
 
-    lifts = [logo_lift(branded, when) for when in stamps]
-    assert all(lift > 60 for lift in lifts), f"the mark is missing somewhere: {lifts}"
+    cores = [logo_core(branded, when) for when in stamps]
+    assert all(core > 120 for core in cores), f"the mark is missing somewhere: {cores}"
     # Constant, not merely present: the spread across the whole video stays small.
-    assert max(lifts) - min(lifts) < 0.35 * max(lifts), f"the mark pulses: {lifts}"
-    # And with branding off there is nothing there, so the metric is measuring the logo.
-    assert logo_lift(plain, stamps[0]) < 40
+    assert max(cores) - min(cores) < 0.35 * max(cores), f"the mark pulses: {cores}"
+    # And with branding off the same patch is just dark background, so the metric is
+    # measuring the logo and not the picture behind it.
+    bare = logo_core(plain, stamps[0])
+    assert bare < 80, f"the unbranded control is not dark: {bare}"
+    assert min(cores) > 1.5 * bare, f"branded {min(cores)} vs unbranded {bare}"
 
 
 @integration

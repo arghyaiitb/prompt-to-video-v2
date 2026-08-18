@@ -181,7 +181,79 @@ def _script_kwargs(provider: Any, job: Job) -> dict[str, Any]:
     return accepted
 
 
+#: Aspect of the hero image panel (720x900 at 1080p). Stills are REQUESTED at this shape
+#: so the renderer's cover-crop has nothing to throw away. Kept as a constant rather than
+#: read from `text_overlay.image_region` because imaging runs before planning, and the
+#: planner holds one hero layout per video anyway.
+_HERO_ASPECT = 0.8
+
+
+def _render_profile() -> RenderProfile:
+    """The render profile for a new job, honouring the configured scene concurrency.
+
+    Split out so a run with several jobs in flight can lower the per-job worker count:
+    the parallelism is per-job, so leaving it on auto oversubscribes the box.
+    """
+    return RenderProfile(render_concurrency=get_settings().video_render_concurrency)
+
+
+def _reused_scenes(source: Timeline) -> list[Scene]:
+    """Clone a previous job's scenes, keeping content and dropping measurements.
+
+    Kept: role, narration, ssml, heading, bullets' TEXT, image_prompt/clip_prompt, and the
+    already-generated ``image_path``/``video_path`` — so a re-render is visually identical
+    and costs no image or clip credits.
+
+    Dropped: ``audio_path``, ``start``/``end``, ``words``, and every bullet's ``appear_at``.
+    Those are measurements of one particular narration. A different voice speaks at a
+    different pace, so they MUST be re-derived — audio is the clock. Carrying them over is
+    exactly how you get bullets that fire against the wrong words.
+    """
+    return [
+        Scene(
+            id=s.id,
+            role=s.role,
+            narration=s.narration,
+            ssml=s.ssml,
+            heading=s.heading,
+            image_prompt=s.image_prompt,
+            clip_prompt=s.clip_prompt,
+            image_path=s.image_path,
+            video_path=s.video_path,
+            bullets=[BulletPoint(text=b.text, emphasis=b.emphasis) for b in s.bullets],
+        )
+        for s in source.scenes
+    ]
+
+
 async def _stage_script(job: Job, job_dir: Path, theme: Theme | None = None) -> Timeline:
+    if job.reuse_from:
+        # A/B rendering: same words, same pictures, different voice. Without this, two
+        # jobs on one topic produce two different scripts and nothing is comparable.
+        source_job = await asyncio.to_thread(_load_job, job.reuse_from)
+        source = timeline_from_job(source_job)
+        if source is None or not source.scenes:
+            raise RuntimeError(
+                f"job {job.reuse_from} has no usable timeline to reuse "
+                f"(status={source_job.status})"
+            )
+        logger.info(
+            "reusing the script and imagery from job %s (%d scenes)",
+            job.reuse_from,
+            len(source.scenes),
+        )
+        return Timeline(
+            job_id=job.id,
+            topic=source.topic,
+            title=source.title,
+            scenes=_reused_scenes(source),
+            voice=job.voice,
+            language=source.language,
+            profile=_render_profile(),
+            theme=theme if theme is not None else source.theme,
+            logo_path=resolve_job_logo(job),
+        )
+
     provider = factory.script_provider()
     script = await asyncio.to_thread(
         functools.partial(
@@ -214,7 +286,7 @@ async def _stage_script(job: Job, job_dir: Path, theme: Theme | None = None) -> 
         title=script.title,
         scenes=scenes,
         voice=job.voice,
-        profile=RenderProfile(),
+        profile=_render_profile(),
     )
     if theme is not None:
         # Stamped on the Timeline so the palette is persisted with the job's debug trail
@@ -283,19 +355,165 @@ async def _stage_images(timeline: Timeline, job_dir: Path) -> None:
     profile = timeline.profile
     limit = asyncio.Semaphore(_api_concurrency())
 
+    # Request the HERO PANEL's aspect, not the frame's. The panel is 4:5 portrait
+    # (720x900); a 16:9 source gets centre-cropped to it, which throws away ~55% of the
+    # width and lands wherever the middle happens to be. Measured consequence: a
+    # perfectly good landscape photo of a phone on a table rendered as three abstract
+    # bands, because the crop landed on the phone's edge. Any wide, centred subject is
+    # gutted the same way.
+    #
+    # Images are generated before planning, so the exact per-scene layout is not known
+    # yet — but the planner holds ONE hero layout for the whole body, so 4:5 is right for
+    # every scene that has a panel.
+    height = profile.height * profile.upscale_factor
+    width = int(round(height * _HERO_ASPECT))
+
     async def one(scene: Scene) -> None:
         out = job_dir / f"scene_{scene.id:02d}.png"
         async with limit:
             path = await asyncio.to_thread(
-                provider.generate,
-                scene.image_prompt,
-                out,
-                profile.width * profile.upscale_factor,
-                profile.height * profile.upscale_factor,
+                provider.generate, scene.image_prompt, out, width, height
             )
         scene.image_path = str(path)
 
-    await _gather_scenes("image generation", [one(s) for s in timeline.scenes])
+    # A reused scene already has its picture. Regenerating would cost credits AND produce
+    # a *different* image — image generation is not deterministic — which defeats the
+    # whole point of reuse: comparing two renders that differ in exactly one thing.
+    pending = [s for s in timeline.scenes if not _usable_asset(s.image_path)]
+    if len(pending) < len(timeline.scenes):
+        logger.info(
+            "reusing %d existing image(s); generating %d",
+            len(timeline.scenes) - len(pending),
+            len(pending),
+        )
+    if pending:
+        await _gather_scenes("image generation", [one(s) for s in pending])
+
+
+def _usable_asset(path: str | None) -> bool:
+    """True when a carried-over asset path still points at a real, non-empty file."""
+    if not path:
+        return False
+    try:
+        return Path(path).is_file() and Path(path).stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _clip_scene(timeline: Timeline) -> Scene | None:
+    """The one scene that gets generated FOOTAGE instead of a still, or None.
+
+    Exactly one clip per video, on the CLOSING scene (docs/DIRECTION.md §7):
+
+    * content and summary scenes carry four bullets to read — moving footage beside text
+      is split attention, and a still with a slow zoom is the right answer there, not a
+      compromise;
+    * the title card is pure type on a solid ground, which is what makes it read as a
+      title, and a soft 720p upscale on the first thing a viewer sees is the worst
+      possible placement;
+    * the closing has two bullets and little to read, so the one thing that changes at
+      the end is that the picture comes alive.
+    """
+    for scene in reversed(timeline.scenes):
+        if scene.role is SceneRole.CLOSING and scene.clip_prompt:
+            return scene
+    return None
+
+
+async def _stage_clips(timeline: Timeline, job_dir: Path) -> None:
+    """Generate the closing scene's footage. Best-effort: a still is a fine fallback.
+
+    Veo returns a FIXED ~8s clip, so the renderer covers any shortfall itself (measured:
+    a crossfaded loop leaves 1.5% duplicate frames, against 60.7% for freezing the final
+    frame). Gated on ``video_enable_veo`` — this is the most expensive call in the
+    pipeline, so it stays opt-in.
+    """
+    provider = factory.video_clip_provider()
+    if provider is None:
+        logger.debug("clip generation disabled; every scene uses its still")
+        return
+
+    scene = _clip_scene(timeline)
+    if scene is None:
+        logger.info("no closing scene carries a clip_prompt; skipping footage")
+        return
+    if _usable_asset(scene.video_path):
+        # Reused from a previous job — and Veo is the most expensive call here, so
+        # regenerating would both cost the most and break the comparison.
+        logger.info("scene %s reuses existing footage: %s", scene.id, scene.video_path)
+        return
+
+    out = job_dir / f"scene_{scene.id:02d}.clip.mp4"
+    try:
+        path = await asyncio.to_thread(
+            provider.generate, scene.clip_prompt or "", scene.duration or 8.0, out
+        )
+    except Exception:
+        logger.warning(
+            "clip generation failed for scene %s; falling back to its still",
+            scene.id,
+            exc_info=True,
+        )
+        return
+    scene.video_path = str(path)
+    logger.info("scene %s uses generated footage: %s", scene.id, path)
+
+
+#: Delivery pace per role, as a multiplier on the engine's configured speed.
+#:
+#: An engine without SSML cannot stress a phrase, but it can change PACE — so the
+#: modulation we do have is spent where it reads: a title card delivered slower lands as
+#: deliberate, and a closing slightly slower lands as an instruction rather than a
+#: throwaway. Content and summary stay at the base rate; varying them would fight the
+#: measured 135 wpm pacing target.
+#: These deltas must be LARGE or they are placebo. Measured: Aura's run-to-run variance on
+#: identical input is ~0.68s over a 7s take, so a 6% speed change is unmeasurable — the
+#: first version of this table used 0.94/0.96 and the "slower" setting came out *shorter*
+#: on average across three repeats. Only a change big enough to clear that noise floor is
+#: real, which is why the title is ~11% slower than content rather than 6%.
+_ROLE_SPEED: dict[SceneRole, float] = {
+    SceneRole.TITLE: 0.89,
+    SceneRole.CONTENT: 1.0,
+    SceneRole.SUMMARY: 1.0,
+    SceneRole.CLOSING: 0.93,
+}
+
+
+def _voice_modulation(synth: Any, scene: Scene, send_ssml: bool) -> dict[str, Any]:
+    """Per-scene delivery kwargs the synthesizer actually accepts.
+
+    Two levers, applied only to engines that expose them (inspected, not assumed — a
+    provider that ignores modulation must keep working unchanged):
+
+    * ``speed`` — scaled per :data:`_ROLE_SPEED`.
+    * ``emphasize`` — the phrase of the emphasised bullet, spoken slower so the spoken
+      stress lands on the words appearing on screen. Aura has no loudness control at all
+      (measured across 7 techniques), so a ~1.55x duration stretch is the closest
+      substitute this engine has.
+
+    Skipped entirely when the engine takes SSML: Polly already carries its own prosody in
+    the markup, and stacking a second mechanism on top would fight it.
+    """
+    if send_ssml:
+        return {}
+    try:
+        accepts = inspect.signature(synth.synthesize).parameters
+    except (TypeError, ValueError):  # pragma: no cover - C callables
+        return {}
+
+    settings = get_settings()
+    out: dict[str, Any] = {}
+    if "speed" in accepts:
+        base = getattr(settings, "video_deepgram_speed", 0.9)
+        out["speed"] = round(base * _ROLE_SPEED.get(scene.role, 1.0), 3)
+    if "emphasize" in accepts:
+        # Only a phrase that appears verbatim can be split out, and only one: the
+        # splice costs an extra request and a join per phrase.
+        for bullet in scene.bullets:
+            if bullet.emphasis and bullet.text.lower() in scene.narration.lower():
+                out["emphasize"] = bullet.text
+                break
+    return out
 
 
 async def _stage_narrate(timeline: Timeline, job_dir: Path, engine: str | None = None) -> None:
@@ -313,8 +531,11 @@ async def _stage_narrate(timeline: Timeline, job_dir: Path, engine: str | None =
     async def one(scene: Scene) -> None:
         out = job_dir / f"scene_{scene.id:02d}.mp3"
         spoken = scene.ssml if (send_ssml and scene.ssml) else scene.narration
+        extra = _voice_modulation(synth, scene, send_ssml)
         async with limit:
-            path = await asyncio.to_thread(synth.synthesize, spoken, timeline.voice, out)
+            path = await asyncio.to_thread(
+                functools.partial(synth.synthesize, spoken, timeline.voice, out, **extra)
+            )
         scene.audio_path = str(path)
 
     await _gather_scenes("narration", [one(s) for s in timeline.scenes])
@@ -546,6 +767,9 @@ async def run_job(job_id: str) -> None:
         async def visual_branch() -> None:
             await _set_stage(job_id, JobStatus.IMAGING, timeline)
             await _stage_images(timeline, job_dir)
+            # Footage rides the visual branch: it depends on nothing from the soundtrack,
+            # and a ~60s Veo call overlaps the audio branch for free.
+            await _stage_clips(timeline, job_dir)
 
         async def audio_branch() -> None:
             await _stage_narrate(timeline, job_dir, engine=job.tts_engine)

@@ -512,6 +512,22 @@ glyph itself, so any character you add appears twice on screen.
     to reveal the real destination", the bullet is "Hover Over The Link" or "Reveal The
     Real Destination" — not "Link Safety".{anchor_note}
 
+    EQUALLY CRITICAL: the quoted run must be a COMPLETE, SELF-CONTAINED instruction that
+    makes sense read alone on a slide. Do NOT simply take the first few words of a
+    sentence and stop. A viewer reads the bullet with no narration to complete it, so a
+    dangling verb phrase reads as a typo and costs more credibility than a weaker match
+    would. Choose WHERE in the sentence to quote so the run ends on a noun or a complete
+    idea, and shorten the narration's phrasing if that is what it takes to make a
+    quotable, complete phrase available.
+
+    If the narration says "summarize secret business strategies in a public prompt box",
+    the bullet is "Summarize Secret Business Strategies" — NOT "Summarize Secret Business",
+    which stops mid-phrase. If it says "visit the internal policy portal today to read
+    full guidelines", the bullet is "Visit The Internal Policy Portal" — NOT "Today To
+    Read Full Guidelines", which starts mid-sentence and reads as nonsense. Never begin a
+    bullet with a word like "today", "and", "then", "so", "which" or "to" that only makes
+    sense as a continuation.
+
     List the bullets in the SAME ORDER the narration mentions them, first to last. Write
     each narration so it naturally contains that scene's number of quotable phrases, spread
     evenly across its whole length rather than clustered in the first sentence: every point

@@ -122,8 +122,22 @@ export interface ThemeContrastFailure {
 export interface BrandLogo {
   /** What `POST /api/jobs` wants in `logo_id`. */
   id: string
-  /** Where to fetch the file — normally `/api/logos/{id}`. */
+  /**
+   * `GET /api/logos/{id}` — the **original** file, as uploaded.
+   *
+   * Not what the preview uses. See `renderUrl`.
+   */
   url: string
+  /**
+   * `GET /api/logos/{id}/render` — the PNG the video is actually branded with.
+   *
+   * This is the one the UI previews. For a PNG the two are the same bytes; for an
+   * SVG they can differ sharply, because the browser has a complete SVG renderer
+   * and the render box does not. Previewing the original would show a `<filter>`
+   * or `<mask>` rendered perfectly and then ship a video where it is missing or
+   * black — which is the exact failure this feature exists to prevent.
+   */
+  renderUrl: string
   /** Source pixel dimensions, when the server measured them. */
   width: number | null
   height: number | null
@@ -136,14 +150,17 @@ export interface BrandLogo {
    */
   has_alpha: boolean | null
   /**
-   * Server-side caveat, e.g. an SVG containing constructs its rasteriser cannot
-   * reproduce. Surfaced verbatim: the backend knows things about its own
-   * ImageMagick build that the browser cannot check.
+   * `warnings` from the upload response — constructs the server's rasteriser
+   * could not reproduce (`mask`, `filter`, …), one string each.
+   *
+   * Surfaced verbatim: the backend knows things about its own ImageMagick build
+   * that the browser cannot check, and the browser's own SVG scan is a
+   * pre-flight guess by comparison.
    */
-  warning: string | null
-  original_filename: string | null
-  bytes: number | null
-  created_at: string | null
+  warnings: string[]
+  filename: string | null
+  size_bytes: number | null
+  uploaded_at: string | null
 }
 
 /**

@@ -758,14 +758,15 @@ function parseBrandLogo(raw: unknown): BrandLogo | null {
     return {
       id,
       url: `${API_BASE}/logos/${encodeURIComponent(id)}`,
+      renderUrl: `${API_BASE}/logos/${encodeURIComponent(id)}/render`,
       width: null,
       height: null,
       format: null,
       has_alpha: null,
-      warning: null,
-      original_filename: null,
-      bytes: null,
-      created_at: null,
+      warnings: [],
+      filename: null,
+      size_bytes: null,
+      uploaded_at: null,
     }
   }
 
@@ -775,23 +776,39 @@ function parseBrandLogo(raw: unknown): BrandLogo | null {
   const id = readString(record, 'id', 'logo_id', 'logoId', 'key', 'name', 'filename')
   if (id === null) return null
 
+  const base = `${API_BASE}/logos/${encodeURIComponent(id)}`
+
+  /*
+   * `warnings` is a **list** of strings on the real endpoint. An earlier draft of
+   * this parser read a singular `warning`; both are accepted now, because a
+   * string is the shape an older or simpler build would send and dropping the
+   * caveat entirely is the one outcome worth avoiding.
+   */
+  const warningList = readList(record.warnings ?? record.warning).filter(
+    (item): item is string => typeof item === 'string' && item.trim() !== '',
+  )
+  const singleWarning = readString(record, 'warning', 'notice', 'caveat')
+  const warnings =
+    warningList.length > 0 ? warningList : singleWarning === null ? [] : [singleWarning]
+
   return {
     id,
     // A relative path from the server wins; otherwise the documented route is
     // derived, because a logo we cannot draw is not worth offering.
-    url:
-      readString(record, 'url', 'href', 'file_url', 'fileUrl', 'path', 'location') ??
-      `${API_BASE}/logos/${encodeURIComponent(id)}`,
+    url: readString(record, 'url', 'href', 'file_url', 'fileUrl', 'path', 'location') ?? base,
+    // What the video will actually carry. Derived rather than read, because the
+    // endpoint does not advertise it in the entry — it is a documented route.
+    renderUrl: readString(record, 'render_url', 'renderUrl') ?? `${base}/render`,
     width: readNumber(record, 'width', 'w', 'pixel_width'),
     height: readNumber(record, 'height', 'h', 'pixel_height'),
     format: readString(record, 'format', 'content_type', 'contentType', 'mime', 'ext')?.toLowerCase() ?? null,
     // Absent means unknown, never "no": an opaque mark composites as a solid
     // rectangle, so the difference is worth reporting honestly.
     has_alpha: readBoolean(record, 'has_alpha', 'hasAlpha', 'alpha', 'transparent'),
-    warning: readString(record, 'warning', 'warnings', 'notice', 'caveat', 'message'),
-    original_filename: readString(record, 'original_filename', 'originalFilename', 'filename', 'name'),
-    bytes: readNumber(record, 'bytes', 'size', 'size_bytes', 'byte_size'),
-    created_at: readString(record, 'created_at', 'createdAt', 'uploaded_at', 'created'),
+    warnings,
+    filename: readString(record, 'filename', 'original_filename', 'originalFilename', 'name'),
+    size_bytes: readNumber(record, 'size_bytes', 'bytes', 'size', 'byte_size'),
+    uploaded_at: readString(record, 'uploaded_at', 'uploadedAt', 'created_at', 'createdAt', 'created'),
   }
 }
 
@@ -1325,12 +1342,50 @@ function postLogo(
   })
 }
 
-/** Deletes a stored logo. A 404 is treated as success: it is already gone. */
+/**
+ * Thrown when a logo cannot be deleted because a job still references it.
+ *
+ * The server answers 409 with the job ids. Those matter: "in use" with no
+ * indication of *what* is using it leaves the user with nothing to act on, and
+ * the referencing job is re-renderable, so the reference is not academic.
+ */
+export class LogoInUseError extends Error {
+  readonly jobIds: string[]
+
+  constructor(jobIds: string[]) {
+    super(
+      jobIds.length === 0
+        ? 'That logo is still in use by a video.'
+        : `That logo is still used by ${String(jobIds.length)} video${jobIds.length === 1 ? '' : 's'}, so it was kept. A re-render would need it.`,
+    )
+    this.name = 'LogoInUseError'
+    this.jobIds = jobIds
+  }
+}
+
+/**
+ * Deletes a stored logo.
+ *
+ * A 404 is treated as success: it is already gone, and reporting a failure for
+ * the outcome the caller wanted is noise. A 409 is not — it means the logo is
+ * still referenced and was deliberately kept.
+ */
 export async function deleteLogo(logoId: string): Promise<void> {
   try {
     await request(`/logos/${encodeURIComponent(logoId)}`, { method: 'DELETE' })
   } catch (cause) {
     if (cause instanceof ApiError && cause.status === 404) return
+    if (cause instanceof ApiError && cause.status === 409) {
+      // `{"error": "logo_in_use", "jobs": [...]}` — which `request` may surface
+      // as the whole body or as its `detail`, so both are looked at.
+      const body = asRecord(cause.detail)
+      const jobs = readList(body?.jobs ?? body?.job_ids ?? [])
+        .map((item) =>
+          typeof item === 'string' ? item : (readString(asRecord(item) ?? {}, 'job_id', 'id') ?? null),
+        )
+        .filter((item): item is string => item !== null)
+      throw new LogoInUseError(jobs)
+    }
     throw cause
   }
 }
